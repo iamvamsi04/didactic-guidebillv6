@@ -7,7 +7,8 @@ import sqlite3
 from database.connection import connect
 
 scope = ContextVar('tool_scope', default=None)
-ADMIN_TOOLS = {'execute_sql_query', 'billing_analysis', 'billing_anomalies', 'download_invoice'}
+ADMIN_TOOLS = {'execute_sql_query', 'billing_analysis', 'billing_anomalies', 'download_invoice', 'process_refund'}
+CASHIER_TOOLS = {'execute_sql_query', 'download_invoice', 'process_refund'}
 CUSTOMER_TOOLS = {'execute_sql_query', 'request_order', 'place_order', 'apply_promotion',
                   'download_invoice', 'manage_draft', 'manage_customer', 'process_refund',
                   'compare_products', 'find_cheaper_alternatives'}
@@ -19,7 +20,7 @@ def scoped_tool(fn):
     def run(*args, **kwargs):
         mode = kwargs.pop('execution_mode', 'customer')
         customer = kwargs.pop('execution_customer_id', None)
-        allowed = ADMIN_TOOLS if mode == 'admin' else CUSTOMER_TOOLS if mode == 'customer' else set()
+        allowed = ADMIN_TOOLS if mode == 'admin' else CASHIER_TOOLS if mode == 'cashier' else CUSTOMER_TOOLS if mode == 'customer' else set()
         if fn.__name__ not in allowed:
             return {'ok': False, 'error': 'This tool is not available in the current mode.'}
         arguments = inspect.signature(fn).bind(*args, **kwargs).arguments
@@ -46,8 +47,8 @@ def scoped_tool(fn):
     return run
 
 
-def customer_query_connection(customer_id):
-    """Materialize only public catalogue and associated customer rows in an isolated DB.
+def customer_query_connection(customer_id, staff=False):
+    """Materialize only public products and associated customer rows in an isolated DB.
 
     User SQL never touches the source connection, preventing joins, CTEs and main.table
     qualification from bypassing a row filter. Original column names are preserved.
@@ -60,20 +61,18 @@ def customer_query_connection(customer_id):
         'product_details': 'SELECT * FROM product_details',
         'product_attributes': 'SELECT * FROM product_attributes',
         'product_relations': 'SELECT * FROM product_relations',
-        'product_features': 'SELECT * FROM product_features',
-        'catalogue_current': 'SELECT * FROM catalogue_current',
-        'invoice_summary': 'SELECT * FROM invoice_summary WHERE customer_id=?',
-        'sales_lines': 'SELECT * FROM sales_lines WHERE customer_id=?',
         'price_history': 'SELECT * FROM price_history',
         'promotions': 'SELECT * FROM promotions',
         'customers': 'SELECT * FROM customers WHERE customer_id=?',
         'orders': 'SELECT * FROM orders WHERE customer_id=?',
     }
-    for table in ('order_requests','order_fulfilled','invoice_lines','order_details','payments','credit_notes'):
+    for table in ('order_requests','order_fulfilled','invoice_lines','order_details','refund_requests'):
         queries[table] = f'SELECT t.* FROM {table} t JOIN orders o ON o.order_id=t.order_id WHERE o.customer_id=?'
     try:
         source.execute('BEGIN')
         for table, sql in queries.items():
+            if staff:
+                sql = sql.replace(' WHERE customer_id=?', '').replace(' WHERE o.customer_id=?', '')
             cursor = source.execute(sql, (customer_id,) if '?' in sql else ())
             columns = [c[0] for c in cursor.description]
             target.execute('CREATE TABLE '+table+' ('+', '.join('"'+c+'"' for c in columns)+')')
