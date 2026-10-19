@@ -2,28 +2,69 @@ import asyncio
 import json
 import os
 import sys
+import logging
+import httpx
+from openai import DefaultAsyncHttpxClient
+from time import perf_counter
 from copy import deepcopy
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.messages import TextMessage
 from autogen_core.model_context import UnboundedChatCompletionContext
 from autogen_core.models import UserMessage, AssistantMessage
+from autogen_core.tools import ToolResult, TextResultContent
 from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
 from autogen_ext.tools.mcp import McpWorkbench, StdioServerParams
 from config import settings
 from agent.system_message import SYSTEM_MESSAGE
-from agent.admin_message import ADMIN_MESSAGE
-from agent.task_policy import TASK_POLICY
+from agent.admin_message import ADMIN_MESSAGE, CASHIER_MESSAGE
+from agent.task_policy import TASK_POLICY, CUSTOMER_TASK_POLICY
 from mcp_server.charts import chart_from_result
-from mcp_server.access import ADMIN_TOOLS, CUSTOMER_TOOLS, SCOPE_FIELDS
+from mcp_server.tools.database import schema_hint
+from mcp_server.access import ADMIN_TOOLS, CASHIER_TOOLS, CUSTOMER_TOOLS, SCOPE_FIELDS
+from context.reply_text import REPLY_POLICY, plain_reply
 from context.shopping_state import ShoppingTracker
 from agent.shopping_policy import shopping_prompt
+
+
+log = logging.getLogger("uvicorn.error.billing_performance")
+
+# Only these tools are allowed together in a model-selected batch. Unknown and
+# mutating tools fail closed before any member of that batch is dispatched.
+BATCH_READ_TOOLS = frozenset({'execute_sql_query', 'compare_products',
+    'find_cheaper_alternatives', 'billing_analysis', 'billing_anomalies'})
+BATCH_POLICY = ('\nYou may request multiple independent read-only tools in one round. '
+    'Use a later round when arguments depend on an earlier result. '
+    'Request writes and invoice generation one tool at a time; never batch them.\n')
+
+
+class TimedAzureClient(AzureOpenAIChatCompletionClient):
+    """Measure SDK requests without logging prompts, identifiers or credentials."""
+    async def create(self, *args, **kwargs):
+        started = perf_counter()
+        try:
+            workbench = getattr(self, 'batch_workbench', None)
+            if workbench is not None:
+                kwargs['extra_create_args'] = {**kwargs.get('extra_create_args', {}),
+                                               'parallel_tool_calls': True}
+            result = await super().create(*args, **kwargs)
+            if workbench is not None:
+                workbench.prepare_batch(result.content)
+            usage = result.usage
+            log.info("billing_model seconds=%.3f input_tokens=%s output_tokens=%s",
+                     perf_counter() - started, usage.prompt_tokens, usage.completion_tokens)
+            return result
+        except BaseException:
+            log.info("billing_model seconds=%.3f status=failed", perf_counter() - started)
+            raise
 
 
 def parameters():
     return StdioServerParams(command=sys.executable, args=["-m", "mcp_server.server"],
                             cwd=str(settings.ROOT), env={**os.environ,
                             "BILLING_DB": str(settings.BILLING_DB),
-                            "INVOICE_DIR": str(settings.INVOICE_DIR)}, read_timeout_seconds=60)
+                            "INVOICE_DIR": str(settings.INVOICE_DIR),
+                            "CASHIER_REFUND_LIMIT": settings.CASHIER_REFUND_LIMIT,
+                            "CASHIER_REFUND_CURRENCY": settings.CASHIER_REFUND_CURRENCY}, read_timeout_seconds=60)
 
 
 def decode_result(result):
@@ -44,20 +85,38 @@ class RecordingWorkbench(McpWorkbench):
         super().__init__(server_params or parameters())
         self.downloads = []
         self.charts = []
+        self.chart_callback = None
+        self._chart_origins = {}
         self.failed = False
         self._tool_schemas = None
         self.mode = 'customer'
         self.customer_id = None
         self.shopping_tracker = None
+        self.tool_seconds = 0.0
+        self.tool_calls = 0
+        self._batch_blocked = False
+        self._dispatch_lock = asyncio.Lock()
+
+    def prepare_batch(self, content):
+        calls = content if isinstance(content, list) else []
+        self._batch_blocked = len(calls) > 1 and any(
+            getattr(call, 'name', None) not in BATCH_READ_TOOLS for call in calls)
+        if len(calls) > 1:
+            log.info('billing_batch calls=%s allowed=%s', len(calls), not self._batch_blocked)
 
     async def list_tools(self):
         # Our server registers a fixed tool set. Cache schemas, never billing data.
         if self._tool_schemas is None:
             self._tool_schemas = await super().list_tools()
-        allowed = ADMIN_TOOLS if self.mode == 'admin' else CUSTOMER_TOOLS
+        allowed = ADMIN_TOOLS if self.mode == 'admin' else CASHIER_TOOLS if self.mode == 'cashier' else CUSTOMER_TOOLS
         schemas = [deepcopy(s) for s in self._tool_schemas if s['name'] in allowed]
         for schema in schemas:
             parameters = schema.get('parameters', {})
+            if self.mode != 'admin' and schema['name'] == 'execute_sql_query':
+                schema['description'] = schema['description'].split('For requested admin visuals', 1)[0].rstrip()
+                parameters.get('properties', {}).pop('chart', None)
+                if 'required' in parameters:
+                    parameters['required'] = [f for f in parameters['required'] if f != 'chart']
             for field in SCOPE_FIELDS:
                 parameters.get('properties', {}).pop(field, None)
             if 'required' in parameters:
@@ -69,25 +128,70 @@ class RecordingWorkbench(McpWorkbench):
         await super().stop()
 
     async def call_tool(self, name, arguments=None, cancellation_token=None, **kwargs):
+        if self._batch_blocked:
+            return ToolResult(name=name, is_error=True, result=[TextResultContent(content=json.dumps({
+                'ok': False, 'error': 'No tools in this batch were executed. Request writes and '
+                'invoice generation one at a time. Only independent read-only tools may be batched.'}))])
+        # AutoGen dispatches a returned batch concurrently. Preserve tool/result
+        # ordering for shopping navigation and checkpoints; savings come from
+        # fewer model round trips, not concurrent database access.
+        async with self._dispatch_lock:
+            return await self._call_tool(name, arguments, cancellation_token, **kwargs)
+
+    async def _call_tool(self, name, arguments=None, cancellation_token=None, **kwargs):
         # The model cannot choose its execution role or customer scope.
         arguments = {**(arguments or {}), 'execution_mode': self.mode,
                      'execution_customer_id': self.customer_id}
-        result = await super().call_tool(name, arguments, cancellation_token, **kwargs)
+        started = perf_counter()
+        try:
+            result = await super().call_tool(name, arguments, cancellation_token, **kwargs)
+        finally:
+            elapsed = perf_counter() - started
+            self.tool_seconds += elapsed
+            self.tool_calls += 1
+            log.info("billing_tool tool=%s seconds=%.3f", name, elapsed)
         self.failed = self.failed or result.is_error
-        if name == 'execute_sql_query' and self.mode == 'admin':
+        if name in ('execute_sql_query', 'billing_analysis') and self.mode == 'admin':
             data = decode_result(result)
-            if data.get('ok') and data.get('chart'):
-                chart = chart_from_result(data)
-                if chart not in self.charts:
-                    if len(self.charts) < 6:
-                        self.charts.append(chart)
-                    else:
-                        data.pop('chart')
-                        data['chart_error'] = 'Six-chart limit reached. Ask for remaining charts in another turn.'
-                        for block in result.result:
-                            if isinstance(getattr(block,'content',None),str):
-                                block.content = json.dumps(data)
-                                break
+            if not self.charts:
+                self._chart_origins.clear()
+            origin = json.dumps({'tool':name, 'args':{k:v for k,v in arguments.items()
+                if k not in ('chart','chart_type')}}, sort_keys=True)
+            attached_before = len(self.charts)
+            sources = [data] if name == 'execute_sql_query' else data.get('chart_results', [])
+            if data.get('ok'):
+                for source in sources:
+                    if not source.get('chart'):
+                        continue
+                    try:
+                        chart = chart_from_result(source)
+                    except (ValueError, KeyError, TypeError) as exc:
+                        source.pop('chart', None)
+                        source['chart_error'] = str(exc)
+                        continue
+                    # Deduplicate only the same read scope; equal totals for two
+                    # different date/customer filters are still distinct reports.
+                    identity = {k:v for k,v in chart.items() if k != 'title'}
+                    if not any(self._chart_origins.get(id(saved)) == origin and
+                               identity == {k:v for k,v in saved.items() if k != 'title'} for saved in self.charts):
+                        if len(self.charts) < 6:
+                            self.charts.append(chart)
+                            self._chart_origins[id(chart)] = origin
+                        else:
+                            source.pop('chart')
+                            source['chart_error'] = 'Six-chart limit reached. Ask for remaining charts in another turn.'
+            errors = [str(source['chart_error']) for source in sources if source.get('chart_error')]
+            # A successful SQL read does not establish that it supplied a chart.
+            data['chart_delivery'] = {'attached_this_call': len(self.charts) - attached_before,
+                'total_attached_this_turn': len(self.charts), 'errors': errors}
+            log.info('billing_chart tool=%s attached=%s total_attached=%s errors=%s',
+                     name, len(self.charts) - attached_before, len(self.charts), errors)
+            for block in result.result:
+                if isinstance(getattr(block, 'content', None), str):
+                    block.content = json.dumps(data)
+                    break
+            if self.chart_callback and len(self.charts) > attached_before:
+                self.chart_callback(deepcopy(self.charts))
         if name == "download_invoice":
             data = decode_result(result)
             if data.get("ok") and data.get("ready"):
@@ -98,6 +202,21 @@ class RecordingWorkbench(McpWorkbench):
                 self.customer_id = data['customer_id']
         if self.shopping_tracker is not None and self.mode == 'customer':
             self.shopping_tracker.observe(name, arguments, decode_result(result), self.customer_id)
+        # Preserve every JSON value while avoiding pretty-print whitespace in
+        # subsequent model requests. Do this after observation/attachment capture.
+        before = after = 0
+        for block in result.result:
+            content = getattr(block, 'content', None)
+            if isinstance(content, str):
+                before += len(content)
+                try:
+                    compact = json.dumps(json.loads(content), ensure_ascii=False, separators=(',', ':'))
+                    if len(compact) < len(content):
+                        block.content = compact
+                except (ValueError, TypeError):
+                    pass
+                after += len(block.content)
+        log.info('billing_payload tool=%s chars_before=%s chars_after=%s', name, before, after)
         return result
 
 
@@ -105,9 +224,14 @@ def create_model_client(**client_options):
     error = settings.azure_configuration_error()
     if error:
         raise ValueError(error)
+    if settings.AZURE_REASONING_EFFORT:
+        client_options.setdefault('reasoning_effort', settings.AZURE_REASONING_EFFORT)
+    if 'http_client' not in client_options:
+        client_options['http_client'] = DefaultAsyncHttpxClient(
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5, keepalive_expiry=60))
     # The deployment controls the Azure route; model is its underlying model name.
     # This assistant needs text chat and tool calling, not vision or structured output.
-    return AzureOpenAIChatCompletionClient(
+    return TimedAzureClient(
         azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
         azure_deployment=settings.AZURE_OPENAI_DEPLOYMENT,
         api_key=settings.AZURE_OPENAI_API_KEY,
@@ -169,15 +293,20 @@ class BillingAgent:
         if error:
             raise ValueError(error)
 
-    async def chat(self, message, history, customer_id, mode='customer', shopping_state=None, state_callback=None):
+    async def chat(self, message, history, customer_id, mode='customer', shopping_state=None, state_callback=None, chart_callback=None):
+        started = perf_counter()
         async with self._lock:
+            acquired = perf_counter()
+            workbench = None
             try:
-                if self._client is None:
-                    self._client = create_model_client()
                 workbench = await self._get_workbench()
+                workbench.tool_seconds = 0.0
+                workbench.tool_calls = 0
                 workbench.downloads.clear()
                 workbench.charts.clear()
+                workbench.chart_callback = chart_callback
                 workbench.mode, workbench.customer_id = mode, customer_id
+                workbench.prepare_batch(None)
                 tracker = ShoppingTracker(shopping_state, customer_id, state_callback) if mode == 'customer' else None
                 workbench.shopping_tracker = tracker
                 memory_prompt = shopping_prompt(tracker.state) if tracker else ''
@@ -189,18 +318,22 @@ class BillingAgent:
                     tracker.stage()
                     if state_callback:
                         state_callback(deepcopy(tracker.state), customer_id)
+                if self._client is None:
+                    self._client = create_model_client()
+                if isinstance(self._client, TimedAzureClient):
+                    self._client.batch_workbench = workbench
                 previous = [UserMessage(content=m["content"], source="user") if m["role"] == "user"
                             else AssistantMessage(content=m["content"], source="billing_agent") for m in history]
                 # Agent/model context is fresh per turn; only transports are shared.
                 agent = AssistantAgent("billing_agent", model_client=self._client, workbench=workbench,
                         model_context=UnboundedChatCompletionContext(initial_messages=previous),
-                        system_message=(ADMIN_MESSAGE if mode == 'admin' else self.system_message) + TASK_POLICY + f"\nAssociated customer_id: {customer_id or 'unset'}\n" + memory_prompt,
+                        system_message=(ADMIN_MESSAGE if mode == 'admin' else CASHIER_MESSAGE if mode == 'cashier' else self.system_message) + (TASK_POLICY if mode == 'admin' else CUSTOMER_TASK_POLICY) + REPLY_POLICY + BATCH_POLICY + '\n' + schema_hint(mode) + f"\nAssociated customer_id: {customer_id or 'unset'}\n" + memory_prompt + (f'\nCashier refund limit: {settings.CASHIER_REFUND_LIMIT} {settings.CASHIER_REFUND_CURRENCY}, inclusive. Other currencies require admin.\n' if mode in ('cashier', 'admin') else ''),
                         reflect_on_tool_use=True, max_tool_iterations=settings.MAX_TOOL_ITERATIONS)
                 result = await agent.run(task=message)
                 final = result.messages[-1]
                 if not isinstance(final, TextMessage):
                     raise RuntimeError("Agent did not produce a final text answer.")
-                reply = tracker.finish(final.content) if tracker else final.content
+                reply = tracker.finish(final.content) if tracker else plain_reply(final.content)
                 return {"response": reply, "invoices": list(workbench.downloads),
                         "charts": list(workbench.charts),
                         "associated_customer_id": workbench.customer_id,
@@ -210,8 +343,14 @@ class BillingAgent:
                 await self._reset()
                 raise
             finally:
+                log.info("billing_turn mode=%s total_seconds=%.3f lock_wait_seconds=%.3f tool_calls=%s tool_seconds=%.3f charts=%s",
+                         mode, perf_counter() - started, acquired - started,
+                         workbench.tool_calls if workbench else 0,
+                         workbench.tool_seconds if workbench else 0.0,
+                         len(workbench.charts) if workbench else 0)
                 if self._workbench is not None:
                     self._workbench.shopping_tracker = None
+                    self._workbench.chart_callback = None
                 if not self._managed or (self._workbench is not None and self._workbench.failed):
                     await self._reset()
 
