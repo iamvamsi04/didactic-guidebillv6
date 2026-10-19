@@ -22,8 +22,12 @@ AZURE_OPENAI_API_KEY = os.getenv('AZURE_OPENAI_API_KEY', '').strip()
 AZURE_OPENAI_DEPLOYMENT = os.getenv('AZURE_OPENAI_DEPLOYMENT', '').strip()
 AZURE_OPENAI_MODEL = os.getenv('AZURE_OPENAI_MODEL', '').strip()
 AZURE_OPENAI_API_VERSION = os.getenv('AZURE_OPENAI_API_VERSION', '').strip()
+AZURE_REASONING_EFFORT = os.getenv('AZURE_OPENAI_REASONING_EFFORT', '').strip().lower()
 API_KEY = os.getenv('BILLING_API_KEY', '')
 ADMIN_API_KEY = os.getenv('BILLING_ADMIN_API_KEY', '')
+CASHIER_API_KEY = os.getenv('BILLING_CASHIER_API_KEY', '')
+CASHIER_REFUND_LIMIT = os.getenv('CASHIER_REFUND_LIMIT', '100.00')
+CASHIER_REFUND_CURRENCY = os.getenv('CASHIER_REFUND_CURRENCY', 'USD').strip().upper()
 SQL_MAX_ROWS = max(1, min(int(os.getenv('SQL_MAX_ROWS', '200')), 1000))
 CHAT_TIMEOUT = int(os.getenv('CHAT_TIMEOUT_SECONDS', '180'))
 MAX_TOOL_ITERATIONS = max(2, min(int(os.getenv('MAX_TOOL_ITERATIONS', '12')), 20))
@@ -38,6 +42,8 @@ AZURE_FIELDS = (
 def azure_configuration_error():
     """Describe incomplete local settings without exposing their values or calling Azure."""
     from urllib.parse import urlsplit
+    if AZURE_REASONING_EFFORT not in ('', 'none', 'low', 'medium', 'high', 'xhigh'):
+        return 'AZURE_OPENAI_REASONING_EFFORT must be blank, none, low, medium, high or xhigh.'
     missing = [name for name in AZURE_FIELDS if not globals()[name]]
     if missing:
         return 'Set these fields in .env and restart the API: ' + ', '.join(missing)
