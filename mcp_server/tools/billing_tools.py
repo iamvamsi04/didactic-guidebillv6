@@ -219,25 +219,67 @@ def place_order(order_id: str, customer_id: str) -> dict:
 
 
 @tool_result
-def process_refund(order_id: str, customer_id: str, reason: str, amount: str | None = None) -> dict:
-    """Record one full or partial ledger refund. No external payment or inventory return occurs."""
+def process_refund(order_id: str, customer_id: str, reason: str, amount: str | None = None,
+                   action: str = 'request', confirmed: bool = False) -> dict:
+    """Request a refund, or approve it with action=approve and confirmed=true in staff mode.
+
+    Customers only request. Cashiers approve within the configured currency/limit;
+    admins approve any valid amount. Pending requests do not change invoice totals.
+    Approval records a local ledger refund, never a payment-provider transfer.
+    """
+    from mcp_server.access import scope
+    from config import settings
+    access = scope.get() or {}
+    role = access.get('mode')
+    if role not in ('customer', 'cashier', 'admin'):
+        raise BillingError('A trusted execution role is required for refunds.')
+    if role == 'customer' and access.get('customer_id') != customer_id:
+        raise BillingError('Select the matching customer first.')
+    if action not in ('request', 'approve'):
+        raise BillingError('Use request or approve.')
+    if action == 'approve' and role not in ('cashier', 'admin'):
+        raise BillingError('Only a cashier or admin can approve refunds.')
+    if action == 'approve' and confirmed is not True:
+        raise BillingError('Explicit staff confirmation is required before approval.')
     if not reason or not reason.strip() or len(reason) > 2000:
-        raise BillingError("A refund reason of 1-2000 characters is required.")
+        raise BillingError('A refund reason of 1-2000 characters is required.')
     with transaction() as conn:
         order = order_row(conn, order_id, customer_id)
         if not is_placed(conn, order):
-            raise BillingError("Only placed orders can be refunded.")
-        if order["refund_status"] or order["refund_amount"] is not None:
-            raise BillingError("A refund is already recorded; duplicate refunds are blocked.")
-        credited = Decimal(conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM credit_notes WHERE order_id=?", (order_id,)).fetchone()[0]) / 100
-        remaining = money(order['charged_price']) - credited
-        refund = money(remaining if amount is None else amount)
-        if refund <= 0 or refund > remaining:
-            raise BillingError("Refund must be positive and no greater than the invoice total less credit notes.")
+            raise BillingError('Only placed orders can be refunded.')
+        if order['refund_status'] or order['refund_amount'] is not None:
+            raise BillingError('A refund is already recorded; duplicate refunds are blocked.')
+        currency_row = conn.execute("SELECT COALESCE(NULLIF(TRIM(d.currency),''),"
+            "(SELECT value FROM billing_config WHERE key='currency'),'USD') "
+            "FROM orders o LEFT JOIN order_details d ON d.order_id=o.order_id WHERE o.order_id=?",
+            (order_id,)).fetchone()
+        currency = currency_row[0].strip().upper()
+        pending = conn.execute('SELECT * FROM refund_requests WHERE order_id=?', (order_id,)).fetchone()
+        refund = money(pending['amount'] if pending and amount is None else
+                       order['charged_price'] if amount is None else amount)
+        if refund <= 0 or refund > money(order['charged_price']):
+            raise BillingError('Refund must be positive and no greater than the invoice total.')
+        if pending and (refund != money(pending['amount']) or currency != pending['currency']
+                        or reason.strip() != pending['reason']):
+            raise BillingError('A request already exists. Approve its exact amount, currency and reason; do not replace it.')
+        if action == 'approve' and role == 'cashier':
+            limit = money(settings.CASHIER_REFUND_LIMIT)
+            if currency != settings.CASHIER_REFUND_CURRENCY or refund > limit:
+                raise BillingError(f'Admin approval required. Cashier limit is {limit} {settings.CASHIER_REFUND_CURRENCY}.')
+        if not pending:
+            conn.execute('INSERT INTO refund_requests(order_id,amount,currency,reason) VALUES (?,?,?,?)',
+                         (order_id, str(refund), currency, reason.strip()))
+        audit_context.get()['arguments'].update(execution_role=role, currency=currency, resolved_amount=str(refund))
+        if action == 'request':
+            return {'order_id':order_id, 'requested_amount':str(refund), 'currency':currency,
+                    'refund_status':'pending_approval', 'note':'Awaiting staff approval. No refund has been recorded or transferred.'}
         conn.execute("UPDATE orders SET refund_amount=?,refund_status='recorded',refund_reason=? WHERE order_id=?",
                      (str(refund), reason.strip(), order_id))
-    return {"order_id": order_id, "refund_amount": str(refund), "refund_status": "recorded",
-            "note": "Recorded in the local ledger only. No payment-provider refund was sent."}
+        conn.execute("UPDATE refund_requests SET status='approved',approved_at=CURRENT_TIMESTAMP,approved_by_role=? WHERE order_id=?",
+                     (role, order_id))
+    return {'order_id':order_id, 'refund_amount':str(refund), 'currency':currency,
+            'refund_status':'recorded', 'approved_by_role':role,
+            'note':'Approved and recorded in the local ledger only. No payment-provider refund was sent.'}
 
 
 @tool_result
