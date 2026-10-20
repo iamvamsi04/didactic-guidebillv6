@@ -41,10 +41,15 @@ def initialize():
     conn = connect()
     try:
         conn.execute('PRAGMA journal_mode=WAL')
+        from database.migrations import remove_retired_tables, remove_views, add_promotion_expiry, add_unknown_fulfillment
+        remove_views(conn)
+        remove_retired_tables(conn)
         conn.executescript((settings.ROOT / 'database/schema.sql').read_text())
+        add_promotion_expiry(conn)
         conn.executescript((settings.ROOT / 'database/operations.sql').read_text())
-        conn.executescript((settings.ROOT / 'database/catalogue.sql').read_text())
         conn.executescript((settings.ROOT / 'database/insights.sql').read_text())
+        conn.executescript((settings.ROOT / 'database/service.sql').read_text())
+        add_unknown_fulfillment(conn)
         conn.executemany('INSERT OR IGNORE INTO billing_config(key,value) VALUES (?,?)',
                          [('tax_rate', '0'), ('shipping_amount', '0'), ('currency', 'USD')])
         conn.commit()
