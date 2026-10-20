@@ -1,7 +1,7 @@
 """Read-only billing insights. Uses stored invoice amounts and current cost estimates."""
 from collections import Counter, defaultdict
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from functools import wraps
 import sqlite3
@@ -37,7 +37,8 @@ def result(fn):
 
 
 def filters(customer_id, order_id, date_from, date_to):
-    clauses, values = ["NOT EXISTS (SELECT 1 FROM order_details d WHERE d.order_id=o.order_id AND d.status='cancelled')"], []
+    clauses, values = ["NOT EXISTS (SELECT 1 FROM order_details d WHERE d.order_id=o.order_id AND d.status='cancelled')",
+                       "NOT EXISTS (SELECT 1 FROM order_service s WHERE s.order_id=o.order_id AND s.fulfillment_status='cancelled')"], []
     for name, value in (("customer_id", customer_id), ("order_id", order_id)):
         if value is not None:
             if not isinstance(value, str) or not value.strip() or len(value) > 50:
@@ -67,7 +68,7 @@ def snapshot(customer_id, order_id, date_from, date_to):
         conn.execute("PRAGMA query_only=ON")
         conn.execute("BEGIN")
         orders = [dict(r) for r in conn.execute(
-            f"SELECT o.*,c.name AS customer_name FROM orders o LEFT JOIN customers c "
+            f"SELECT o.*,c.name AS customer_name,s.fulfillment_status FROM orders o LEFT JOIN order_service s ON s.order_id=o.order_id LEFT JOIN customers c "
             f"ON c.customer_id=o.customer_id WHERE {where} ORDER BY o.order_date,o.order_id LIMIT ?",
             [*args, LIMIT + 1])]
         if len(orders) > LIMIT:
@@ -76,7 +77,7 @@ def snapshot(customer_id, order_id, date_from, date_to):
         for table in ("invoice_lines", "order_requests", "order_fulfilled"):
             related[table] = [dict(r) for r in conn.execute(
                 f"SELECT x.* FROM {table} x JOIN orders o ON o.order_id=x.order_id WHERE {where}", args)]
-        # Load only catalogue/history records referenced by this selection.
+        # Load only products/history records referenced by this selection.
         item_filter = (
             "SELECT item_code FROM invoice_lines WHERE order_id IN (SELECT o.order_id FROM orders o WHERE " + where + ") "
             "UNION SELECT item_code FROM order_requests WHERE order_id IN (SELECT o.order_id FROM orders o WHERE " + where + ") "
@@ -88,14 +89,19 @@ def snapshot(customer_id, order_id, date_from, date_to):
         for row in conn.execute(f"SELECT * FROM price_history WHERE item_code IN ({item_filter})", args * 3):
             histories[row["item_code"]].append(dict(row))
         config = dict(conn.execute("SELECT key,value FROM billing_config"))
+        fallback = str(config.get('currency', 'USD')).strip().upper()
         currencies = {r[0] for r in conn.execute(
-            f"SELECT DISTINCT COALESCE(d.currency,?) FROM orders o LEFT JOIN order_details d "
+            f"SELECT DISTINCT COALESCE(NULLIF(UPPER(TRIM(d.currency)),''),?) FROM orders o LEFT JOIN order_details d "
             f"ON d.order_id=o.order_id WHERE o.order_invoice IS NOT NULL AND {where}",
-            [config.get('currency', 'USD'), *args])}
+            [fallback, *args])}
+        if any(not c or len(c)!=3 or not c.isascii() or not c.isalpha() for c in currencies):
+            raise ValueError('An invoice has missing or invalid currency. Correct it before analyzing totals.')
         if len(currencies) > 1:
             raise ValueError('Selection spans multiple currencies. Narrow the selection or query separate currency groups.')
         if currencies:
             config['currency'] = next(iter(currencies))
+        else:
+            config['currency'] = fallback
         yield orders, related, items, histories, config
     finally:
         conn.close()
@@ -143,14 +149,28 @@ def costing(orders, lines, items):
 @result
 def billing_analysis(customer_id: str | None = None, order_id: str | None = None,
                      date_from: str | None = None, date_to: str | None = None,
-                     top_n: int = 10) -> dict:
+                     top_n: int = 10, trend_period: str | None = None,
+                     trend_metric: str = 'order_total', chart_type: str = 'line', report: str | None = None) -> dict:
     """Analyze invoices and break down revenue, discounts, tax, shipping, ledger refunds and estimated costs.
 
+    report=pending_refunds/pending_above_threshold lists requests; refund_reconciliation compares local approvals with refunds/credits on approval dates. Never bank settlements.
     Optional filters intersect; dates are inclusive order dates (YYYY-MM-DD).
     Drafts are counted but excluded from financial totals. Costs use CURRENT item
     baseprice, not historical cost. This is a billing ledger, not payment settlement.
     Use for billing analytics or cost breakdown questions; never modifies records.
+    For a revenue/order-total trend CHART set trend_period to day, week, month, quarter or year.
+    trend_metric: order_total (charged_price, without subtracting refunds), net_billed (after refunds),
+    refunds, subtotal, discount, tax or shipping. chart_type: line or bar.
+    Prefer this validated report for invoice trends: it groups each invoice once, normalizes currency,
+    separates currencies and returns chart artifacts. Existing date/customer/order filters apply.
     """
+    if report is not None:
+        if report not in ('pending_refunds','pending_above_threshold','refund_reconciliation'): raise ValueError('Unknown local refund report.')
+        from mcp_server.tools.service_workflows import refund_report
+        return refund_report(report,date_from,date_to,customer_id,order_id)
+
+    if trend_period is not None:
+        return invoice_trend(customer_id, order_id, date_from, date_to, trend_period, trend_metric, chart_type)
     if type(top_n) is not int or not 1 <= top_n <= 25:
         raise ValueError("top_n must be an integer from 1 to 25.")
     with snapshot(customer_id, order_id, date_from, date_to) as (orders, related, items, history, config):
@@ -175,7 +195,7 @@ def billing_analysis(customer_id: str | None = None, order_id: str | None = None
             "totals": amounts, "average_invoice_total": cash(dec(amounts["charged_price"])/len(placed)) if placed else "0.00",
             "estimated_product_cost": cash(estimated) if not missing else None,
             "estimated_merchandise_margin_before_refunds": cash(dec(amounts["subtotal"])-dec(amounts["discount_applied"])-estimated) if not missing else None,
-            "missing_catalogue_items": missing,
+            "missing_product_items": missing,
             "top_customers": customer_rows[:top_n], "customers_truncated": len(customer_rows)>top_n,
             "top_products": product_rows, "products_truncated": len(products)>top_n,
             "notes": ["All matching invoices contribute to totals; top lists alone are limited.",
@@ -183,7 +203,62 @@ def billing_analysis(customer_id: str | None = None, order_id: str | None = None
                 "Product line revenue is before order-level discounts, tax, shipping and refunds.",
                 "Refunds are ledger entries. Net billed does not prove money was collected or returned.",
                 "Currency uses invoice snapshots where available; legacy invoices use the current configuration.",
-                "These are invoice face-value analytics. Legacy payments and credits are excluded from these face-value analytics."]}
+                "These are invoice face-value analytics. Payments and credit notes are not tracked; these totals are not outstanding balances or proof of payment."]}
+
+
+def invoice_trend(customer_id, order_id, date_from, date_to, period, metric, chart_type):
+    """Invoice-grain, decimal-safe report. No guessed joins or cross-currency sums."""
+    fields = {'order_total':'charged_price','net_billed':'charged_price','refunds':'refund_amount',
+              'subtotal':'subtotal','discount':'discount_applied','tax':'tax_amount','shipping':'shipping_amount'}
+    if not isinstance(period,str) or not isinstance(metric,str) or period not in ('day','week','month','quarter','year') or metric not in fields:
+        raise ValueError('Choose day/week/month/quarter/year and a supported invoice trend metric.')
+    from mcp_server.charts import canonical_chart_type
+    chart_type = canonical_chart_type(chart_type)
+    if chart_type not in ('line','bar'):
+        raise ValueError('Invoice trends support line or bar charts.')
+    where, args = filters(customer_id, order_id, date_from, date_to)
+    conn = connect(readonly=True)
+    try:
+        records = conn.execute('SELECT o.*, COALESCE(NULLIF(UPPER(TRIM(d.currency)),\'\'), '
+            '(SELECT NULLIF(UPPER(TRIM(value)),\'\') FROM billing_config WHERE key=\'currency\')) AS report_currency '
+            'FROM orders o LEFT JOIN order_details d ON d.order_id=o.order_id WHERE '
+            + where + ' AND o.order_invoice IS NOT NULL ORDER BY o.order_date,o.order_id LIMIT ?', [*args,LIMIT+1]).fetchall()
+    finally:
+        conn.close()
+    if len(records)>LIMIT:
+        raise ValueError('Too many invoices for a complete trend. Narrow the date/customer scope.')
+    buckets = defaultdict(lambda: defaultdict(lambda: ZERO))
+    for row in records:
+        currency = row['report_currency']
+        if not currency or len(currency)!=3 or not currency.isascii() or not currency.isalpha():
+            raise ValueError('An invoice has missing or invalid currency. Correct the record before charting.')
+        day = date.fromisoformat(row['order_date'])
+        if period=='week': day -= timedelta(days=day.weekday())
+        elif period=='month': day=day.replace(day=1)
+        elif period=='quarter': day=day.replace(month=(day.month-1)//3*3+1,day=1)
+        elif period=='year': day=day.replace(month=1,day=1)
+        amount = dec(row[fields[metric]])
+        if metric=='net_billed': amount -= dec(row['refund_amount'])
+        buckets[currency][day.isoformat()] += amount
+    if len(buckets)>6:
+        raise ValueError('More than six currencies match. Narrow the scope before requesting charts.')
+    from mcp_server.charts import prepare_chart
+    reports=[]
+    for currency, values in sorted(buckets.items()):
+        columns=['period',metric,'currency']
+        rows=[[key,cash(value),currency] for key,value in sorted(values.items())]
+        label={'day':'Daily','week':'Weekly','month':'Monthly','quarter':'Quarterly','year':'Yearly'}[period]
+        chart=prepare_chart(columns,rows,{'type':chart_type,'x':'period','y':[metric],
+            'x_type':'temporal','title':f'{label} {metric.replace("_"," ")} ({currency})'})
+        reports.append({'columns':columns,'rows':rows,'row_count':len(rows),'truncated':False,
+                        'chart':{k:v for k,v in chart.items() if k!='data'}})
+    return {'report':'invoice_trend','period':period,'metric':metric,'invoice_count':len(records),
+        'filters':{'customer_id':customer_id,'order_id':order_id,'date_from':date_from,'date_to':date_to},
+        'chart_results':reports,'notes':[
+            'Order totals are stored charged_price; refunds are subtracted only for net_billed.',
+            'Issued invoices only; cancelled orders excluded. One contribution per order. Currencies remain separate.',
+            'Periods start on the plotted date; weeks start Monday. Missing periods are not fabricated as zero.',
+            'Legacy invoices without currency snapshots use configured currency. No payment settlement is implied.']}
 
 
 @result
@@ -236,9 +311,12 @@ def billing_anomalies(customer_id: str | None = None, order_id: str | None = Non
                 for row in records:
                     counts[row["item_code"]] += row[field]
                 return dict(counts)
-            if not (quantities(lines, "qty_billed") == quantities(shipped, "quantity") == quantities(demand, "quantity")):
-                flag("QUANTITY_MISMATCH", order, {"billed": quantities(lines, "qty_billed"),
-                     "fulfilled": quantities(shipped, "quantity"), "requested": quantities(demand, "quantity")}, "error")
+            billed_qty,fulfilled_qty,requested_qty=quantities(lines,'qty_billed'),quantities(shipped,'quantity'),quantities(demand,'quantity')
+            if not (billed_qty==fulfilled_qty==requested_qty):
+                partial=(order.get('fulfillment_status')=='shipped' and billed_qty==fulfilled_qty and bool(billed_qty)
+                         and all(0<qty<=requested_qty.get(code,0) for code,qty in billed_qty.items()))
+                flag('PARTIAL_FULFILLMENT' if partial else 'QUANTITY_MISMATCH',order,
+                     {'billed':billed_qty,'fulfilled':fulfilled_qty,'requested':requested_qty},'warning' if partial else 'error')
             for line in lines:
                 evidence = {"item_code": line["item_code"], "invoice_line_id": line["id"]}
                 if line["qty_billed"] <= 0 or dec(line["unit_price_billed"]) < 0 or dec(line["line_total"]) < 0:
@@ -253,7 +331,7 @@ def billing_anomalies(customer_id: str | None = None, order_id: str | None = Non
                     flag("HISTORICAL_PRICE_MISMATCH", order, {**evidence,
                          "history_price": cash(history[0]["unit_price"]), "billed_price": cash(line["unit_price_billed"])})
                 if line["item_code"] not in items:
-                    flag("MISSING_CATALOGUE_ITEM", order, evidence, "error")
+                    flag("MISSING_PRODUCT_ITEM", order, evidence, "error")
             if dec(order["charged_price"]) > threshold:
                 flag("HIGH_INVOICE_VALUE", order, {"total": cash(order["charged_price"]), "threshold": cash(threshold)}, "review")
         placed = [o for o in orders if invoiced(o)]
@@ -301,5 +379,5 @@ def billing_anomalies(customer_id: str | None = None, order_id: str | None = Non
                 "Drafts are checked for total/refund/record consistency but excluded from invoice-based recommendations.",
                 "Price mismatches compare against currently stored dated price history; missing history is not replaced with today's selling price.",
                 "Historical tax rates, shipping costs, purchase costs and promotion versions are unavailable, so they are not inferred.",
-                "Inventory suggestions cover products billed in the selected period, not the entire catalogue.",
+                "Inventory suggestions cover products billed in the selected period, not the entire products.",
                 "No changes or refunds are executed by this tool."]}
