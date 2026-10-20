@@ -97,9 +97,11 @@ Check candidate stock and current price before recommending or quoting. Do not r
 
 G. Financial definitions and avoiding duplicated totals
 Issued invoices have order_invoice IS NOT NULL. Drafts/cancelled drafts are not billed sales.
-For issued-order totals read orders o LEFT JOIN order_details d ON d.order_id=o.order_id and filter
-COALESCE(d.status,'active')<>'cancelled'. Keep the user's requested customer/date/order filters.
-Currency is COALESCE(d.currency,(SELECT value FROM billing_config WHERE key='currency'),'USD').
+For active issued-order totals read orders o LEFT JOIN order_details d ON d.order_id=o.order_id
+LEFT JOIN order_service s ON s.order_id=o.order_id; exclude both COALESCE(d.status,'active')='cancelled'
+and COALESCE(s.fulfillment_status,'placed')='cancelled'. Cancelled invoices remain historical records;
+include them only when the requested measure explicitly covers cancellations. Keep requested filters.
+Currency is UPPER(TRIM(COALESCE(NULLIF(TRIM(d.currency),''),(SELECT value FROM billing_config WHERE key='currency'),'USD'))).
 Group or filter by currency; never sum money in unlike currencies.
 Sum subtotal, charged_price, tax_amount, shipping_amount, discount_applied and refund_amount at the
 ORDER level. Joining invoice_lines/order_requests/order_fulfilled before summing duplicates order totals.
@@ -111,7 +113,7 @@ Charged invoice total = subtotal minus applied discount plus tax plus shipping, 
 Recorded refund-adjusted invoice amount = charged_price minus COALESCE(refund_amount,0), rounded
 for currency reporting. It is not cash collected or an outstanding amount due.
 Payments and credit notes are not stored. No paid/unpaid status, actual balance due, overdue debt,
-customer credit balance, provider refund timing or payment reconciliation can be established here.
+provider refund timing or payment reconciliation can be established here.
 Order due dates do not supply those missing payment facts. Refer payment reconciliation to store staff.
 Current baseprice supports admin estimated procurement cost, not historical cost or operating profit.
 State which margin/cost measure is being reported and its limitations. Never treat it as audited net profit.
