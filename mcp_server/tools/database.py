@@ -8,7 +8,8 @@ from database.connection import connect
 
 TABLES = {'billing_config', 'customers', 'items', 'promotions', 'orders',
           'order_requests', 'order_fulfilled', 'invoice_lines', 'price_history',
-          'order_details', 'billing_audit', 'refund_requests',
+          'order_details', 'billing_audit', 'refund_requests', 'refund_details', 'order_service',
+          'customer_billing_details','invoice_revisions','store_credit_ledger',
           'product_details', 'product_attributes', 'product_relations', 'json_each'}
 FUNCTIONS = set('abs avg coalesce count date datetime glob group_concat hex ifnull '
                 'instr julianday length like lower ltrim max min nullif printf replace '
@@ -86,7 +87,8 @@ def execute_sql_query(query: str | None = None, chart: dict | None = None, param
     Use effective price_history for current prices; overlapping prices are unknown, never guessed.
 
     Join/filter/group permitted base tables instead of needing a tool per question.
-    Inspect columns with PRAGMA. No database views exist. Payment and credit records are unavailable.
+    Inspect columns with PRAGMA. No database views exist. External payment records are unavailable;
+    store_credit_ledger records local credit grants and redemptions only.
     Invoice totals minus recorded refunds are not amounts due or proof of settlement.
     Use ? placeholders with parameters for user-provided values; never interpolate names into SQL.
     For requested admin visuals optionally pass chart={"type":"bar","title":"Revenue","x":"month","y":["revenue"]}.
