@@ -8,6 +8,8 @@ from uuid import UUID
 from typing import Literal
 from fastapi import FastAPI, Depends, Header, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 from openai import APIConnectionError, APITimeoutError, APIStatusError
 from config import settings
@@ -15,6 +17,7 @@ from context import context_manager as context
 from context.reply_text import plain_reply
 from database.connection import initialize as initialize_billing
 from database.invoice import invoice_path
+from api import customer_auth
 
 log = logging.getLogger(__name__)
 
@@ -62,13 +65,20 @@ def require_cashier(key, admin_key=None):
         raise HTTPException(403, 'Cashier access denied.')
 
 
-def check_record(record, admin_key, cashier_key=None):
+def require_customer(customer_id, token):
+    if customer_auth.customer_for_token(token) != customer_id:
+        raise HTTPException(401, 'Sign in to the matching customer account.')
+
+
+def check_record(record, admin_key, cashier_key=None, customer_token=None):
     if not record:
         raise HTTPException(404, 'Conversation not found.')
     if record['mode'] == 'admin':
         require_admin(admin_key)
     elif record['mode'] == 'cashier':
         require_cashier(cashier_key, admin_key)
+    elif record['customer_id']:
+        require_customer(record['customer_id'], customer_token)
 
 
 @asynccontextmanager
@@ -94,6 +104,16 @@ app = FastAPI(title="Billing Agent", version="7.0.0", lifespan=lifespan,
               dependencies=[Depends(authorize)])
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_error(request, exc):
+    if request.url.path.startswith('/customers/'):
+        return JSONResponse(status_code=422, content={'detail': 'Check the customer ID, account details and password length (10 to 128 characters).'})
+    # Do not echo user-supplied values in error responses.
+    errors = [{key: value for key, value in error.items() if key not in ('input', 'ctx')}
+              for error in exc.errors()]
+    return JSONResponse(status_code=422, content={'detail': errors})
+
+
 class ConversationRequest(BaseModel):
     customer_id: str | None = Field(default=None, max_length=50, pattern=r"^[A-Za-z0-9_-]+$")
     mode: Literal['customer', 'cashier', 'admin'] = 'customer'
@@ -103,6 +123,42 @@ class ChatRequest(BaseModel):
     conversation_id: UUID
     request_id: UUID
     message: str = Field(min_length=1, max_length=10000)
+
+
+class CustomerLogin(BaseModel):
+    customer_id: str = Field(min_length=1, max_length=50, pattern=r'^[A-Za-z0-9_-]+$')
+    password: str = Field(min_length=10, max_length=128, repr=False, exclude=True)
+
+
+class CustomerRegistration(CustomerLogin):
+    name: str = Field(min_length=1, max_length=200)
+    company: str | None = Field(default=None, max_length=200)
+    email: str | None = Field(default=None, max_length=200)
+
+
+@app.post('/customers/register', status_code=201)
+def register_customer(body: CustomerRegistration):
+    try:
+        return customer_auth.register(body.customer_id, body.name, body.password, body.company, body.email)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post('/customers/login')
+def login_customer(body: CustomerLogin):
+    try:
+        session = customer_auth.login(body.customer_id, body.password)
+    except ValueError:
+        session = None
+    if not session:
+        raise HTTPException(401, 'Unable to sign in. Check your credentials or contact store staff.')
+    return session
+
+
+@app.post('/customers/logout')
+def logout_customer(x_customer_token: str | None = Header(default=None)):
+    customer_auth.logout(x_customer_token)
+    return {'signed_out': True}
 
 
 @app.get("/health")
@@ -117,11 +173,13 @@ async def health():
 
 
 @app.post("/conversations")
-async def create_conversation(body: ConversationRequest, x_admin_key: str | None = Header(default=None), x_cashier_key: str | None = Header(default=None)):
+async def create_conversation(body: ConversationRequest, x_admin_key: str | None = Header(default=None), x_cashier_key: str | None = Header(default=None), x_customer_token: str | None = Header(default=None)):
     if body.mode == 'admin':
         require_admin(x_admin_key)
     elif body.mode == 'cashier':
         require_cashier(x_cashier_key, x_admin_key)
+    elif body.customer_id:
+        require_customer(body.customer_id, x_customer_token)
     return {"conversation_id": context.conversation(customer_id=body.customer_id, mode=body.mode), 'mode': body.mode}
 
 
@@ -139,9 +197,9 @@ async def cashier_access(x_cashier_key: str | None = Header(default=None), x_adm
 
 
 @app.get("/conversations/{conversation_id}")
-async def get_conversation(conversation_id: UUID, x_admin_key: str | None = Header(default=None), x_cashier_key: str | None = Header(default=None)):
+async def get_conversation(conversation_id: UUID, x_admin_key: str | None = Header(default=None), x_cashier_key: str | None = Header(default=None), x_customer_token: str | None = Header(default=None)):
     record = context.get_conversation(str(conversation_id))
-    check_record(record, x_admin_key, x_cashier_key)
+    check_record(record, x_admin_key, x_cashier_key, x_customer_token)
     messages = context.history(str(conversation_id), include_artifacts=True)
     messages = [{**m, "content": plain_reply(m["content"])} if m["role"] == "assistant" else m for m in messages]
     return {**record, "messages": messages,
@@ -149,20 +207,20 @@ async def get_conversation(conversation_id: UUID, x_admin_key: str | None = Head
 
 
 @app.post("/chat")
-async def chat(body: ChatRequest, x_admin_key: str | None = Header(default=None), x_cashier_key: str | None = Header(default=None)):
-    return await run_chat(body, x_admin_key, x_cashier_key=x_cashier_key)
+async def chat(body: ChatRequest, x_admin_key: str | None = Header(default=None), x_cashier_key: str | None = Header(default=None), x_customer_token: str | None = Header(default=None)):
+    return await run_chat(body, x_admin_key, x_cashier_key=x_cashier_key, x_customer_token=x_customer_token)
 
 
 @app.post('/chat/stream')
-async def stream_chat(body: ChatRequest, x_admin_key: str | None = Header(default=None), x_cashier_key: str | None = Header(default=None)):
+async def stream_chat(body: ChatRequest, x_admin_key: str | None = Header(default=None), x_cashier_key: str | None = Header(default=None), x_customer_token: str | None = Header(default=None)):
     # Check access before returning a streaming response or starting any work.
-    check_record(context.get_conversation(str(body.conversation_id)), x_admin_key, x_cashier_key)
+    check_record(context.get_conversation(str(body.conversation_id)), x_admin_key, x_cashier_key, x_customer_token)
     async def events():
         stream_started = perf_counter()
         queue = asyncio.Queue()
         async def run():
             try:
-                result = await run_chat(body, x_admin_key, x_cashier_key=x_cashier_key,
+                result = await run_chat(body, x_admin_key, x_cashier_key=x_cashier_key, x_customer_token=x_customer_token,
                     chart_callback=lambda charts: queue.put_nowait({'event':'charts','charts':charts}))
                 queue.put_nowait({'event':'result','result':result})
             except HTTPException as exc:
@@ -191,17 +249,18 @@ async def stream_chat(body: ChatRequest, x_admin_key: str | None = Header(defaul
         headers={'Cache-Control':'no-cache', 'X-Accel-Buffering':'no'})
 
 
-async def run_chat(body, x_admin_key, chart_callback=None, x_cashier_key=None):
+async def run_chat(body, x_admin_key, chart_callback=None, x_cashier_key=None, x_customer_token=None):
     cid, rid = str(body.conversation_id), str(body.request_id)
     if not body.message.strip():
         raise HTTPException(422, "Message must not be blank.")
+    check_record(context.get_conversation(cid), x_admin_key, x_cashier_key, x_customer_token)
     # One worker and one active turn: no mutable agent state is shared across users.
     queued = perf_counter()
     async with app.state.chat_lock:
         logging.getLogger("uvicorn.error.billing_performance").info(
             "billing_api queue_wait_seconds=%.3f", perf_counter() - queued)
         record = context.get_conversation(cid)
-        check_record(record, x_admin_key, x_cashier_key)
+        check_record(record, x_admin_key, x_cashier_key, x_customer_token)
         try:
             cached = context.begin(cid, rid, body.message)
         except ValueError as exc:
@@ -228,8 +287,8 @@ async def run_chat(body, x_admin_key, chart_callback=None, x_cashier_key=None):
                                             timeout=settings.CHAT_TIMEOUT)
             result["response"] = plain_reply(result["response"])
             associated = result.pop('associated_customer_id', None)
-            if associated and not record['customer_id'] and record['mode'] == 'customer':
-                context.associate_customer(cid, associated)
+            if associated and record['mode'] == 'customer' and associated != record['customer_id']:
+                raise ValueError('Customer association requires verified sign-in in a new conversation.')
             response = {"conversation_id": cid, "request_id": rid, **result}
             context.finish(cid, rid, response)
             return response
@@ -247,9 +306,10 @@ async def run_chat(body, x_admin_key, chart_callback=None, x_cashier_key=None):
 
 @app.get("/invoices/{invoice_number}")
 async def invoice(invoice_number: str, conversation_id: UUID, customer_id: str | None = None,
-                  x_admin_key: str | None = Header(default=None), x_cashier_key: str | None = Header(default=None)):
+                  x_admin_key: str | None = Header(default=None), x_cashier_key: str | None = Header(default=None),
+                  x_customer_token: str | None = Header(default=None)):
     record = context.get_conversation(str(conversation_id))
-    check_record(record, x_admin_key, x_cashier_key)
+    check_record(record, x_admin_key, x_cashier_key, x_customer_token)
     associated = record["customer_id"]
     if associated and customer_id and associated != customer_id:
         raise HTTPException(403, "Invoice customer does not match this conversation.")
