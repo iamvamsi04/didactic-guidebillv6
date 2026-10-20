@@ -31,6 +31,8 @@ def request_headers():
         headers['X-Admin-Key'] = st.session_state.admin_key
     if st.session_state.get('mode') == 'Cashier' and st.session_state.get('cashier_key'):
         headers['X-Cashier-Key'] = st.session_state.cashier_key
+    if st.session_state.get('mode') == 'Customer' and st.session_state.get('customer_token'):
+        headers['X-Customer-Token'] = st.session_state.customer_token
     return headers
 
 
@@ -75,24 +77,77 @@ def streamed_chat(body, placeholder):
     raise httpx.ReadError('Chat stream ended before the saved response arrived.')
 
 
-for key, value in {"messages": [], "conversation_id": None, "pending": None, 'admin_key': '', 'cashier_key': '', 'mode': 'Customer'}.items():
+for key, value in {"messages": [], "conversation_id": None, "pending": None, 'admin_key': '', 'cashier_key': '',
+                   'customer_token': '', 'customer_id': '', 'account_error': '', 'mode': 'Customer'}.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
 
-def reset_mode():
+def clear_customer_session():
     st.session_state.messages = []
     st.session_state.conversation_id = None
     st.session_state.pending = None
+    for key in ('customer_token', 'customer_id', 'customer_password', 'customer_password_repeat',
+                'customer_login_id', 'customer_name', 'customer_company', 'customer_email'):
+        st.session_state[key] = ''
+
+
+def reset_mode():
+    token = st.session_state.customer_token
+    clear_customer_session()
+    st.session_state.account_error = ''
     st.session_state.admin_key = ''
     st.session_state.admin_password = ''
     st.session_state.cashier_key = ''
     st.session_state.cashier_password = ''
+    if token:
+        try:
+            api_client().post(API + '/customers/logout', timeout=3.0,
+                headers={**HEADERS, 'X-Customer-Token': token}).raise_for_status()
+        except httpx.HTTPError:
+            st.session_state.account_error = 'Signed out on this screen. The server could not be reached to revoke the session.'
+
+
+def handle_expired_session(exc):
+    if (st.session_state.mode == 'Customer' and st.session_state.customer_token
+            and isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 401):
+        clear_customer_session()
+        st.session_state.account_error = 'Your session ended. Please sign in again.'
+        st.rerun()
 
 
 def logout():
     reset_mode()
     st.session_state.mode = 'Customer'
+
+
+def customer_account(action):
+    st.session_state.account_error = ''
+    password = st.session_state.get('customer_password', '')
+    try:
+        if action == 'register' and password != st.session_state.get('customer_password_repeat', ''):
+            st.session_state.account_error = 'The two passwords must match.'
+            return
+        body = {'customer_id': st.session_state.get('customer_login_id', '').strip(), 'password': password}
+        if action == 'register':
+            body.update(name=st.session_state.get('customer_name', '').strip(),
+                        company=st.session_state.get('customer_company', '').strip() or None,
+                        email=st.session_state.get('customer_email', '').strip() or None)
+        response = api_client().post(API + '/customers/' + action, headers=HEADERS, json=body)
+        response.raise_for_status()
+        account = response.json()
+        st.session_state.customer_token = account['token']
+        st.session_state.customer_id = account['customer_id']
+        st.session_state.conversation_id = None
+        st.session_state.messages = []
+        st.session_state.pending = None
+    except httpx.HTTPStatusError as exc:
+        st.session_state.account_error = error_reply(exc.response)
+    except httpx.HTTPError:
+        st.session_state.account_error = 'Unable to reach the store. Please try again.'
+    finally:
+        st.session_state.customer_password = ''
+        st.session_state.customer_password_repeat = ''
 
 with st.sidebar:
     st.subheader("Store assistant")
@@ -134,7 +189,28 @@ with st.sidebar:
         st.button('Log out of cashier mode', on_click=logout)
     else:
         st.caption('Shopping and billing help')
-    customer = st.text_input("Customer ID (optional)", placeholder="CUST001", disabled=bool(st.session_state.conversation_id))
+        if st.session_state.customer_token:
+            st.caption('Signed in as ' + st.session_state.customer_id)
+            st.button('Sign out', on_click=reset_mode)
+        else:
+            st.caption('Browse without signing in. Sign in for your orders, invoices and refunds.')
+            with st.expander('Customer account'):
+                account_action = st.selectbox('Account', ['Sign in', 'Create account'])
+                with st.form('customer_account_form'):
+                    st.text_input('Customer ID', key='customer_login_id')
+                    if account_action == 'Create account':
+                        st.text_input('Name', key='customer_name')
+                        st.text_input('Company (optional)', key='customer_company')
+                        st.text_input('Email (optional)', key='customer_email')
+                    st.text_input('Password', type='password', key='customer_password', help='Use 10 to 128 characters. Do not put your password in chat.')
+                    if account_action == 'Create account':
+                        st.text_input('Repeat password', type='password', key='customer_password_repeat')
+                    st.form_submit_button(account_action, on_click=customer_account,
+                                          args=('register' if account_action == 'Create account' else 'login',))
+        if st.session_state.account_error:
+            st.error(st.session_state.account_error)
+    customer = (st.session_state.customer_id if st.session_state.mode == 'Customer' else
+                st.text_input('Customer ID (optional)', placeholder='CUST001', disabled=bool(st.session_state.conversation_id)))
     if st.button("New conversation", use_container_width=True):
         st.session_state.messages = []
         st.session_state.conversation_id = None
@@ -152,6 +228,7 @@ with st.sidebar:
             st.session_state.pending = None
             st.rerun()
         except httpx.HTTPError as exc:
+            handle_expired_session(exc)
             st.error(f"Could not resume: {exc}")
     if st.session_state.conversation_id:
         st.caption("Conversation ID")
@@ -185,6 +262,7 @@ def show_invoices(entry, index):
                     "conversation_id": st.session_state.conversation_id, "customer_id": invoice["customer_id"]})
                 st.download_button("Download invoice", pdf.content, "invoice.pdf", "application/pdf", key=f"dl-{index}-{n}")
             except httpx.HTTPError as exc:
+                handle_expired_session(exc)
                 st.error(f"Invoice unavailable: {exc}")
 
 
@@ -210,6 +288,7 @@ if prompt:
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.rerun()
     except httpx.HTTPError as exc:
+        handle_expired_session(exc)
         st.error(f"Could not start the conversation: {exc}")
 
 if st.session_state.pending:
@@ -225,6 +304,7 @@ if st.session_state.pending:
         st.session_state.pending = None
         st.rerun()
     except httpx.HTTPError as exc:
+        handle_expired_session(exc)
         detail = error_reply(exc.response) if isinstance(exc, httpx.HTTPStatusError) else "Unable to reach the Billing Agent. Check that the API is running."
         st.error(f"Request failed: {detail}")
         st.caption("Check current order state before repeating a write. A timed-out request may have completed.")
