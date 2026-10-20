@@ -4,6 +4,7 @@ from contextlib import closing
 from decimal import Decimal
 import hashlib
 import json
+from context.reply_text import plain_reply, reply_envelope
 import logging
 from typing import Annotated, Literal
 
@@ -24,8 +25,9 @@ class Budget(BaseModel):
 
 class Proposal(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    action: Literal['place_order', 'replace_items', 'cancel_draft', 'create_customer',
-                    'update_customer', 'process_refund']
+    action: Literal['place_order', 'replace_items', 'cancel_draft',
+                    'update_customer', 'process_refund', 'cancel_order', 'apply_store_credit',
+                    'correct_invoice', 'report_billing_issue', 'escalate_refund', 'bulk_refund']
     order_id: ProductID | None = None
     summary: str = Field(min_length=1, max_length=1500)
 
@@ -57,7 +59,7 @@ def empty_state():
             'preferred_features': {}, 'quantity': None, 'known_products': [],
             'compared_product_ids': [], 'displayed_product_ids': [], 'selected_product_ids': [],
             'current_draft': None, 'last_order': None, 'pending_confirmation': None,
-            'next_question': None}
+            'next_question': None, 'product_query': None}
 
 
 def order_snapshot(order_id, customer_id):
@@ -70,22 +72,43 @@ def order_snapshot(order_id, customer_id):
             WHERE o.order_id=? AND o.customer_id=?''', (order_id, customer_id)).fetchone()
         if row is None:
             return None
-        state = 'placed' if row['order_invoice'] else 'cancelled' if row['status'] == 'cancelled' else 'draft'
+        service=conn.execute('SELECT fulfillment_status,credit_requested,shipped_at,delivered_at,cancelled_at FROM order_service WHERE order_id=?',(order_id,)).fetchone()
+        state = 'cancelled' if row['status']=='cancelled' or (service and service[0]=='cancelled') else 'placed' if row['order_invoice'] else 'draft'
         currency = row['currency'] or conn.execute("SELECT value FROM billing_config WHERE key='currency'").fetchone()[0]
-        result = {'order_id': row['order_id'], 'status': state, 'invoice_number': row['order_invoice'],
+        result = {'order_id': row['order_id'], 'order_date': row['order_date'], 'status': state, 'invoice_number': row['order_invoice'],
                   'currency': currency, 'promo_code': row['promo_code'],
                   'totals': {k:format(Decimal(str(row[k])), '.2f') for k in
                              ('subtotal','discount_applied','tax_amount','shipping_amount','charged_price')},
                   'items': [dict(r) for r in conn.execute('''SELECT r.item_code,i.name,r.quantity
                       FROM order_requests r JOIN items i ON i.item_code=r.item_code
                       WHERE r.order_id=? ORDER BY r.item_code''', (order_id,))]}
+        credit=Decimal(str(service['credit_requested'])) if service else Decimal(0)
+        result['store_credit_requested']=format(credit,'.2f')
+        result['remaining_invoice_amount']=format(Decimal(str(row['charged_price']))-credit,'.2f')
+        result['fulfillment_status'] = service['fulfillment_status'] if service else None
+        result['fulfillment_dates'] = {key: service[key] if service else None for key in
+                                       ('shipped_at', 'delivered_at', 'cancelled_at')}
+        result['refund'] = {key: row[key] for key in ('refund_amount', 'refund_status', 'refund_reason')}
+        refund = conn.execute('''SELECT r.status,r.amount,r.currency,r.reason,d.disposition,d.target_order_id,
+            r.requested_at,r.approved_at,d.items_json,d.request_kind,d.return_received,d.waiver_reason,
+            d.escalated_at,d.escalation_note
+            FROM refund_requests r LEFT JOIN refund_details d ON d.order_id=r.order_id WHERE r.order_id=?''',
+            (order_id,)).fetchone()
+        result['refund_request'] = dict(refund) if refund else None
+        result['invoice_revision'] = conn.execute('SELECT MAX(id) FROM invoice_revisions WHERE order_id=?',
+                                                 (order_id,)).fetchone()[0]
+        if row['order_invoice']:
+            result['billed_items'] = [dict(line) for line in conn.execute('''SELECT item_code,qty_billed,
+                unit_price_billed,line_total FROM invoice_lines WHERE order_id=? ORDER BY item_code''', (order_id,))]
     result['fingerprint'] = hashlib.sha256(json.dumps(result, sort_keys=True).encode()).hexdigest()
     return result
 
 
 class ShoppingTracker:
     def __init__(self, state, customer_id, checkpoint=None):
-        self.state = {**empty_state(), **deepcopy(state or {})}
+        defaults = empty_state()
+        self.state = {**defaults, **{key: deepcopy(value) for key, value in (state or {}).items()
+                                    if key in defaults}}
         self.customer_id = customer_id
         self.checkpoint = checkpoint
         self.completed_actions = set()
@@ -148,6 +171,11 @@ class ShoppingTracker:
             self.remember_products([result['source']['item_code']] +
                                    [p['item_code'] for p in result.get('alternatives', [])])
         elif name == 'execute_sql_query' and 'item_code' in result.get('columns', []):
+            self.state['product_query'] = {
+                'query': arguments.get('query'),
+                'parameters': deepcopy(arguments.get('parameters') or []),
+                'row_count': result.get('row_count', 0),
+                'truncated': result.get('truncated', False)}
             index = result['columns'].index('item_code')
             self.remember_products([row[index] for row in result.get('rows', [])])
         elif name in ('request_order','manage_draft','apply_promotion','place_order','process_refund'):
@@ -158,9 +186,27 @@ class ShoppingTracker:
                 self.state['last_order'] = {k:snapshot[k] for k in ('order_id','status','invoice_number')}
             if snapshot:
                 self.remember_products([p['item_code'] for p in snapshot['items']])
+            if name == 'process_refund':
+                action = {'request': 'process_refund', 'escalate': 'escalate_refund',
+                          'bulk_request': 'bulk_refund'}.get(arguments.get('action', 'request'))
+            elif name == 'manage_draft':
+                action = arguments.get('action')
+                if action == 'cancel':
+                    action = 'cancel_order' if snapshot and snapshot['invoice_number'] else 'cancel_draft'
+            else:
+                action = name
+            # A quote/status/preview is evidence for the next proposal, never an
+            # already submitted request. Mark only actual successful mutations.
+            if action:
+                self.state['pending_confirmation'] = None
+                self.completed_actions.add((action, None if action == 'bulk_refund' else result.get('order_id')))
+        elif name == 'download_invoice' and arguments.get('action') == 'correct_details':
             self.state['pending_confirmation'] = None
-            action = arguments.get('action') if name == 'manage_draft' else name
-            self.completed_actions.add(('cancel_draft' if action == 'cancel' else action, result.get('order_id')))
+            with closing(connect(readonly=True)) as conn:
+                corrected = conn.execute('SELECT order_id FROM orders WHERE order_invoice=? AND customer_id=?',
+                                         (arguments.get('invoice_number'), customer_id)).fetchone()
+            if corrected:
+                self.completed_actions.add(('correct_invoice', corrected[0]))
         elif name == 'manage_customer':
             self.state['pending_confirmation'] = None
             self.completed_actions.add((arguments.get('action','create')+'_customer', None))
@@ -179,7 +225,7 @@ class ShoppingTracker:
             allowed.update(self.state[key])
         for key in ('displayed_product_ids','selected_product_ids'):
             if key in update and (len(set(update[key])) != len(update[key]) or not set(update[key]) <= allowed):
-                raise ValueError('Product selections must come from observed catalogue results.')
+                raise ValueError('Product selections must come from observed product results.')
         snapshot = None
         if update.get('active_draft_id'):
             snapshot = order_snapshot(update['active_draft_id'], self.customer_id)
@@ -198,6 +244,7 @@ class ShoppingTracker:
                         'displayed_product_ids','selected_product_ids'):
                 self.state[key] = empty_state()[key]
             self.state['last_order'] = None
+            self.state['product_query'] = None
         for key in ('needs','budget','quantity','displayed_product_ids','selected_product_ids'):
             if key in update:
                 self.state[key] = update[key]
@@ -210,9 +257,21 @@ class ShoppingTracker:
             order_id = proposed.get('order_id')
             order = order_snapshot(order_id, self.customer_id) if order_id else None
             action = proposed['action']
-            is_customer = action in ('create_customer','update_customer')
-            expected = 'placed' if action == 'process_refund' else 'draft'
-            if (is_customer and not order_id) or (not is_customer and order and order['status'] == expected):
+            account_action = action == 'update_customer'
+            bulk_action = action == 'bulk_refund'
+            expected = ('placed', 'cancelled') if action in ('correct_invoice', 'report_billing_issue', 'escalate_refund') else (
+                ('placed',) if action in ('process_refund', 'cancel_order') else ('draft',))
+            eligible = bool(order and order['status'] in expected)
+            if action == 'cancel_order':
+                eligible = eligible and order['fulfillment_status'] == 'placed' and not order['refund_request'] and order['refund']['refund_amount'] is None
+            elif action == 'process_refund':
+                eligible = eligible and not order['refund_request'] and order['refund']['refund_amount'] is None
+            elif action == 'correct_invoice':
+                eligible = eligible and bool(order['invoice_number'])
+            elif action == 'escalate_refund':
+                eligible = eligible and bool(order['refund_request'])
+            if ((account_action and not order_id and self.customer_id) or (bulk_action and not order_id and self.customer_id) or
+                    (not account_action and not bulk_action and eligible)):
                 proposed['status'] = 'awaiting_customer'
                 proposed['order_fingerprint'] = order['fingerprint'] if order else None
                 self.state['pending_confirmation'] = proposed
@@ -227,20 +286,30 @@ class ShoppingTracker:
         try:
             envelope = json.loads(raw)
         except (ValueError, TypeError):
-            if '"shopping_update"' in raw and (raw.startswith('{') or raw.startswith('```')):
-                raise ValueError('Shopping response JSON is incomplete.') from None
-            # Plain text responses remain usable. Never guess preferences from keywords.
-            self.stage()
-            return content
+            envelope = reply_envelope(raw)
+            if envelope is None:
+                if '"shopping_update"' in raw and (raw.startswith('{') or raw.startswith('```')):
+                    raise ValueError('Shopping response JSON is incomplete.') from None
+                # Plain text responses remain usable. Never guess preferences from keywords.
+                self.stage()
+                return plain_reply(content)
         if not isinstance(envelope,dict) or 'shopping_update' not in envelope:
             self.stage()
-            return content
+            return plain_reply(content)
         reply = envelope.get('reply')
         if not isinstance(reply,str) or not reply.strip():
             raise ValueError('Customer reply is missing from the shopping response.')
+        reply = plain_reply(reply)
+        update = deepcopy(envelope['shopping_update'])
+        if isinstance(update, dict):
+            proposal = update.get('pending_confirmation')
+            if isinstance(proposal, dict) and isinstance(proposal.get('summary'), str):
+                proposal['summary'] = plain_reply(proposal['summary'])
+            if isinstance(update.get('next_question'), str):
+                update['next_question'] = plain_reply(update['next_question'])
         saved = deepcopy(self.state)
         try:
-            self.apply_update(envelope['shopping_update'], reply)
+            self.apply_update(update, reply)
         except (ValidationError, ValueError, TypeError):
             self.state = saved
             self.stage()
