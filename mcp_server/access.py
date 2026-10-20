@@ -7,7 +7,7 @@ import sqlite3
 from database.connection import connect
 
 scope = ContextVar('tool_scope', default=None)
-ADMIN_TOOLS = {'execute_sql_query', 'billing_analysis', 'billing_anomalies', 'download_invoice', 'process_refund'}
+ADMIN_TOOLS = {'execute_sql_query', 'billing_analysis', 'billing_anomalies', 'download_invoice', 'process_refund', 'manage_draft'}
 CASHIER_TOOLS = {'execute_sql_query', 'download_invoice', 'process_refund'}
 CUSTOMER_TOOLS = {'execute_sql_query', 'request_order', 'place_order', 'apply_promotion',
                   'download_invoice', 'manage_draft', 'manage_customer', 'process_refund',
@@ -24,16 +24,13 @@ def scoped_tool(fn):
         if fn.__name__ not in allowed:
             return {'ok': False, 'error': 'This tool is not available in the current mode.'}
         arguments = inspect.signature(fn).bind(*args, **kwargs).arguments
+        if mode in ('admin', 'cashier') and fn.__name__ == 'download_invoice' and arguments.get('action', 'generate') != 'generate':
+            return {'ok': False, 'error': 'Staff invoice access is read-only. The customer must confirm corrections in their own conversation.'}
+        if mode == 'customer' and fn.__name__ == 'manage_customer' and arguments.get('action', 'create') == 'create':
+            return {'ok': False, 'error': 'Create your account using the registration form, then sign in. Account credentials must never be sent in chat.'}
         if mode == 'customer' and 'customer_id' in arguments:
-            creating = fn.__name__ == 'manage_customer' and arguments.get('action', 'create') == 'create'
-            if creating and customer is None:
-                # An anonymous shopper may create a NEW account, never adopt an existing one.
-                with closing(connect(readonly=True)) as conn:
-                    exists = conn.execute('SELECT 1 FROM customers WHERE customer_id=?', (arguments['customer_id'],)).fetchone()
-                if exists:
-                    return {'ok': False, 'error': 'Existing customer: start a conversation with that customer selected.'}
-            elif not customer or arguments['customer_id'] != customer:
-                return {'ok': False, 'error': 'Select the matching customer in a new conversation first.'}
+            if not customer or arguments['customer_id'] != customer:
+                return {'ok': False, 'error': 'Sign in to the matching customer account before accessing its records.'}
         token = scope.set({'mode': mode, 'customer_id': customer})
         try:
             return fn(*args, **kwargs)
@@ -65,8 +62,10 @@ def customer_query_connection(customer_id, staff=False):
         'promotions': 'SELECT * FROM promotions',
         'customers': 'SELECT * FROM customers WHERE customer_id=?',
         'orders': 'SELECT * FROM orders WHERE customer_id=?',
+        'customer_billing_details':'SELECT * FROM customer_billing_details WHERE customer_id=?',
+        'store_credit_ledger':'SELECT * FROM store_credit_ledger WHERE customer_id=?',
     }
-    for table in ('order_requests','order_fulfilled','invoice_lines','order_details','refund_requests'):
+    for table in ('order_requests','order_fulfilled','invoice_lines','order_details','refund_requests','refund_details','order_service','invoice_revisions'):
         queries[table] = f'SELECT t.* FROM {table} t JOIN orders o ON o.order_id=t.order_id WHERE o.customer_id=?'
     try:
         source.execute('BEGIN')
