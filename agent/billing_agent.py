@@ -17,6 +17,7 @@ from autogen_ext.tools.mcp import McpWorkbench, StdioServerParams
 from config import settings
 from agent.system_message import SYSTEM_MESSAGE
 from agent.admin_message import ADMIN_MESSAGE, CASHIER_MESSAGE
+from agent.store_policy import STORE_POLICY
 from agent.task_policy import TASK_POLICY, CUSTOMER_TASK_POLICY
 from mcp_server.charts import chart_from_result
 from mcp_server.tools.database import schema_hint
@@ -63,6 +64,7 @@ def parameters():
                             cwd=str(settings.ROOT), env={**os.environ,
                             "BILLING_DB": str(settings.BILLING_DB),
                             "INVOICE_DIR": str(settings.INVOICE_DIR),
+                            "RETURN_WINDOW_DAYS": settings.RETURN_WINDOW_DAYS,
                             "CASHIER_REFUND_LIMIT": settings.CASHIER_REFUND_LIMIT,
                             "CASHIER_REFUND_CURRENCY": settings.CASHIER_REFUND_CURRENCY}, read_timeout_seconds=60)
 
@@ -112,6 +114,13 @@ class RecordingWorkbench(McpWorkbench):
         schemas = [deepcopy(s) for s in self._tool_schemas if s['name'] in allowed]
         for schema in schemas:
             parameters = schema.get('parameters', {})
+            if schema['name'] == 'manage_customer':
+                schema['description'] = ('Update the signed-in customer after confirmation. '
+                    'Use action=update and preserve unchanged contact fields. Account registration uses the account form.')
+                action = parameters.get('properties', {}).get('action', {})
+                action.pop('default', None)
+                action['enum'] = ['update']
+                parameters['required'] = list(dict.fromkeys([*parameters.get('required', []), 'action']))
             if self.mode != 'admin' and schema['name'] == 'execute_sql_query':
                 schema['description'] = schema['description'].split('For requested admin visuals', 1)[0].rstrip()
                 parameters.get('properties', {}).pop('chart', None)
@@ -196,10 +205,6 @@ class RecordingWorkbench(McpWorkbench):
             data = decode_result(result)
             if data.get("ok") and data.get("ready"):
                 self.downloads.append({"invoice_number": data["invoice_number"], "customer_id": data["customer_id"]})
-        if name == 'manage_customer' and self.mode == 'customer' and self.customer_id is None:
-            data = decode_result(result)
-            if data.get('ok') and data.get('action') == 'create':
-                self.customer_id = data['customer_id']
         if self.shopping_tracker is not None and self.mode == 'customer':
             self.shopping_tracker.observe(name, arguments, decode_result(result), self.customer_id)
         # Preserve every JSON value while avoiding pretty-print whitespace in
@@ -327,7 +332,7 @@ class BillingAgent:
                 # Agent/model context is fresh per turn; only transports are shared.
                 agent = AssistantAgent("billing_agent", model_client=self._client, workbench=workbench,
                         model_context=UnboundedChatCompletionContext(initial_messages=previous),
-                        system_message=(ADMIN_MESSAGE if mode == 'admin' else CASHIER_MESSAGE if mode == 'cashier' else self.system_message) + (TASK_POLICY if mode == 'admin' else CUSTOMER_TASK_POLICY) + REPLY_POLICY + BATCH_POLICY + '\n' + schema_hint(mode) + f"\nAssociated customer_id: {customer_id or 'unset'}\n" + memory_prompt + (f'\nCashier refund limit: {settings.CASHIER_REFUND_LIMIT} {settings.CASHIER_REFUND_CURRENCY}, inclusive. Other currencies require admin.\n' if mode in ('cashier', 'admin') else ''),
+                        system_message=(ADMIN_MESSAGE if mode == 'admin' else CASHIER_MESSAGE if mode == 'cashier' else self.system_message) + (TASK_POLICY if mode == 'admin' else CUSTOMER_TASK_POLICY) + STORE_POLICY + REPLY_POLICY + BATCH_POLICY + '\n' + schema_hint(mode) + f"\nReturn window: {settings.RETURN_WINDOW_DAYS} days from order_date, inclusive UTC calendar days; checked at request and approval.\nAssociated customer_id: {customer_id or 'unset'}\n" + memory_prompt + (f'\nCashier refund limit: {settings.CASHIER_REFUND_LIMIT} {settings.CASHIER_REFUND_CURRENCY}, inclusive. Other currencies require admin.\n' if mode in ('cashier', 'admin') else ''),
                         reflect_on_tool_use=True, max_tool_iterations=settings.MAX_TOOL_ITERATIONS)
                 result = await agent.run(task=message)
                 final = result.messages[-1]
