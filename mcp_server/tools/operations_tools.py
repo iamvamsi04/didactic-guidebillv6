@@ -36,7 +36,8 @@ def ensure_customer(conn, customer_id):
 
 @tool_result
 def manage_customer(customer_id: str, name: str, company: str = '', email: str = '',
-                    action: str = 'create', confirmed: bool = False) -> dict:
+                    action: str = 'create', confirmed: bool = False, billing_address: str | None = None,
+                    tax_registration_number: str | None = None) -> dict:
     """Create or update a customer after confirmation. Update replaces all contact fields; show them first.
 
     Existing issued invoice contact snapshots are preserved. Use SQL to look up a customer before editing.
@@ -52,8 +53,16 @@ def manage_customer(customer_id: str, name: str, company: str = '', email: str =
         existing = conn.execute('SELECT * FROM customers WHERE customer_id=?', (customer_id,)).fetchone()
         if action == 'create':
             if existing:
+                from mcp_server.access import scope
+                execution = scope.get()
+                if execution and execution.get('mode') == 'customer' and not execution.get('customer_id'):
+                    raise BillingError('Existing customer: start a conversation with that customer selected.')
                 if (existing['name'], existing['company'] or '', existing['email'] or '') != (name, company, email):
                     raise BillingError('Customer ID exists with different details. Use update after confirmation.')
+                profile = conn.execute('SELECT * FROM customer_billing_details WHERE customer_id=?', (customer_id,)).fetchone()
+                for field, value in (('billing_address', billing_address), ('tax_registration_number', tax_registration_number)):
+                    if value is not None and (not isinstance(value, str) or value.strip() != (profile[field] if profile else '')):
+                        raise BillingError('Customer ID exists with different billing details. Use update after confirmation.')
                 return {'customer_id': customer_id, 'already_exists': True}
             conn.execute('INSERT INTO customers VALUES (?,?,?,?)', (customer_id, name, company, email))
         elif action == 'update':
@@ -61,18 +70,32 @@ def manage_customer(customer_id: str, name: str, company: str = '', email: str =
             conn.execute('UPDATE customers SET name=?,company=?,email=? WHERE customer_id=?', (name, company, email, customer_id))
         else:
             raise BillingError('Action must be create or update.')
+        if billing_address is not None or tax_registration_number is not None:
+            old=conn.execute('SELECT * FROM customer_billing_details WHERE customer_id=?',(customer_id,)).fetchone()
+            address=billing_address if billing_address is not None else old['billing_address'] if old else ''
+            tax_id=tax_registration_number if tax_registration_number is not None else old['tax_registration_number'] if old else ''
+            if not isinstance(address,str) or len(address)>2000 or not isinstance(tax_id,str) or len(tax_id)>100:
+                raise BillingError('Billing address must be at most 2000 characters; tax number at most 100.')
+            conn.execute('INSERT INTO customer_billing_details VALUES (?,?,?) ON CONFLICT(customer_id) DO UPDATE SET billing_address=excluded.billing_address,tax_registration_number=excluded.tax_registration_number',(customer_id,address.strip(),tax_id.strip()))
     return {'customer_id': customer_id, 'name': name, 'company': company, 'email': email, 'action': action}
 
 
 @tool_result
 def manage_draft(order_id: str, customer_id: str, action: str, items: list[dict] | None = None,
-                 reason: str = '', confirmed: bool = False) -> dict:
-    """After confirmation, replace all lines of a draft or cancel it. action: replace_items or cancel.
+                 reason: str = '', confirmed: bool = False, credit_amount: str | None = None) -> dict:
+    """After confirmation: replace_items edits drafts; cancel cancels drafts or whole unshipped issued orders.
+    apply_store_credit allocates credit_amount to an owned draft; report_billing_issue stores reason for review.
+    Authenticated admin only: ship/deliver update issued-order fulfillment status.
 
-    items is the complete desired list of item_code and integer quantity. Never edits issued invoices.
-    Cancellation retains records for audit and does not restock since drafts never reserved stock.
+    items is the complete desired list of item_code and integer quantity. Issued invoice lines and totals are immutable.
+    Cancellation retains records; only whole unshipped issued orders restore their fulfilled stock.
+    Set credit_amount to zero to clear a draft's store-credit allocation.
     """
     confirm(confirmed)
+    from mcp_server.access import scope
+    role=(scope.get() or {}).get('mode','customer')
+    if role=='admin' and action not in ('ship','deliver'): raise BillingError('Admin order access permits only confirmed shipment/delivery transitions.')
+    if action in ('ship','deliver') and role!='admin': raise BillingError('Only authenticated admin may update fulfillment status.')
     with transaction() as conn:
         existing_meta = conn.execute('SELECT status FROM order_details WHERE order_id=?', (order_id,)).fetchone()
         if existing_meta and existing_meta['status'] == 'cancelled' and action == 'cancel':
@@ -80,6 +103,15 @@ def manage_draft(order_id: str, customer_id: str, action: str, items: list[dict]
             if owner and owner[0] == customer_id:
                 return {'order_id': order_id, 'status': 'cancelled', 'already_cancelled': True}
         order = order_row(conn, order_id, customer_id)
+        if action in ('ship','deliver'):
+            from mcp_server.tools.service_workflows import fulfillment_transition
+            return fulfillment_transition(conn,order,action)
+        if action in ('report_billing_issue','apply_store_credit'):
+            from mcp_server.tools.service_workflows import service_action
+            return service_action(conn,order,action,reason,credit_amount)
+        if is_placed(conn, order) and action=='cancel':
+            from mcp_server.tools.service_workflows import cancel_placed
+            return cancel_placed(conn,order,text(reason,'Cancellation reason'))
         if is_placed(conn, order):
             raise BillingError('Issued invoices cannot be edited. Review the supported refund workflow with store staff.')
         if action == 'cancel':
