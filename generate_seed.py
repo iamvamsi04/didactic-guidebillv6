@@ -3,14 +3,16 @@
 Run: python generate_seed.py
 Options: --db database/demo.db --seed 42 --as-of 2026-10-08
 Relative database paths resolve against the project folder. The default is BILLING_DB.
-Existing records/config are preserved. Refuse batches exceeding 500 main-table rows.
-The fake_seed_v1 configuration marker prevents duplicate inserts on subsequent runs.
+Existing active records/config are preserved. Retired payment/credit records are archived before removal.
+Refuse batches exceeding 500 main-table rows.
+Upgrades the original fake_seed_v1 dataset with products facts and tool demos.
+The fake_seed_v2 marker makes the complete upgrade repeatable without duplicate inserts.
 """
 from __future__ import annotations
 
 import argparse
 from datetime import date, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 import json
 from pathlib import Path
 import random
@@ -21,8 +23,10 @@ from mcp_server.tools.billing_tools import money, price_for, totals, update_tota
 
 MAIN_COUNTS = {"customers": 400, "items": 400, "orders": 350,
                "order_requests": 450, "order_fulfilled": 400, "invoice_lines": 400}
-TABLES = (*MAIN_COUNTS, "price_history", "promotions", "billing_config")
+TABLES = (*MAIN_COUNTS, "price_history", "promotions", "billing_config", "order_details",
+          "product_details", "product_attributes", "product_relations", "billing_audit")
 MARKER = "fake_seed_v1"
+ENRICHMENT_MARKER = 'fake_seed_v2'
 FIRST = "Alex Jamie Sam Taylor Morgan Jordan Casey Avery Riley Cameron Quinn Devon".split()
 LAST = "Morgan Chen Rivera Reed Patel Smith Lewis Brooks Park Carter Diaz Evans".split()
 PRODUCTS = [
@@ -34,6 +38,156 @@ PRODUCTS = [
     ("USB cable", 1290), ("Laptop sleeve", 2490), ("Desk mat", 1790),
     ("Wi-Fi router", 8990), ("Portable projector", 34900), ("Document scanner", 22900),
 ]
+CATEGORIES = ['keyboards','mice','monitors','hubs','stands','webcams','headsets','storage',
+              'lamps','chairs','adapters','speakers','power_banks','monitor_arms','cables',
+              'sleeves','desk_mats','routers','projectors','scanners']
+
+
+def product_facts(family, variant):
+    """Synthetic specifications for fictional models, never claims about real products."""
+    connection = 'wireless' if variant % 2 else 'wired'
+    definitions = [
+        ({'connection':connection,'layout':'compact' if variant%3==0 else 'full size','compatibility':'Windows and macOS'},'battery_life',20+variant*2,'hours'),
+        ({'connection':connection,'handedness':'ambidextrous'},'sensitivity',800*(1+variant%4),'dpi'),
+        ({'resolution':['1080p','1440p','4K'][variant%3],'input':'HDMI'},'screen_size',[24,27,32][variant%3],'inch'),
+        ({'host_port':'USB-C','display_output':'HDMI'},'port_count',4+variant%5,'ports'),
+        ({'material':'aluminium','adjustable':True},'load_capacity',3+variant%4,'kg'),
+        ({'connection':'USB','resolution':['1080p','1440p','4K'][variant%3]},'frame_rate',30 if variant%2 else 60,'fps'),
+        ({'connection':connection,'noise_cancelling':bool(variant%2)},'battery_life',12+variant*2,'hours'),
+        ({'interface':'USB-C','drive_type':'SSD'},'capacity',[256,512,1024,2048][variant%4],'GB'),
+        ({'dimmable':True,'power_source':'USB'},'brightness',400+variant*25,'lumen'),
+        ({'material':'mesh','adjustable_height':True},'load_capacity',100+variant*5,'kg'),
+        ({'host_port':'USB-C','network_port':'Ethernet'},'network_speed',1000 if variant%2 else 2500,'Mbps'),
+        ({'connection':'Bluetooth','water_resistant':bool(variant%2)},'battery_life',8+variant,'hours'),
+        ({'output_port':'USB-C','fast_charging':True},'capacity',10000+variant*1000,'mAh'),
+        ({'mount':'VESA 100x100','adjustable':True},'load_capacity',6+variant%5,'kg'),
+        ({'connector_a':'USB-C','connector_b':'USB-C'},'length',1+variant%3,'m'),
+        ({'material':'padded fabric','water_resistant':True},'screen_size',[13,14,15,16][variant%4],'inch'),
+        ({'material':'fabric','washable':True},'width',60+variant*2,'cm'),
+        ({'standard':'Wi-Fi 6','dual_band':True},'network_speed',1200+variant*100,'Mbps'),
+        ({'input':'HDMI','resolution':'1080p'},'brightness',1500+variant*100,'lumen'),
+        ({'connection':'USB','duplex':bool(variant%2)},'scan_speed',15+variant,'ppm'),
+    ]
+    return definitions[family]
+
+
+def seed_product_details(conn):
+    groups = {}
+    for row in conn.execute("SELECT item_code FROM items WHERE item_code GLOB 'FAKE-ITEM-[0-9][0-9][0-9][0-9]' ORDER BY item_code").fetchall():
+        code = row['item_code']
+        index = int(code.rsplit('-',1)[1])-1
+        family, variant = index%20, index//20
+        features, attribute, number, unit = product_facts(family,variant)
+        # Wired equipment has no battery; omit an inapplicable numeric attribute.
+        if family in (0,6) and features['connection']=='wired':
+            attribute,number,unit = 'cable_length',1.5+variant%3/2,'m'
+        category = CATEGORIES[family]
+        conn.execute('INSERT OR IGNORE INTO product_details VALUES (?,?,?,?)',
+            (code,category,f'Fictional {category} demo model; specifications are synthetic for practice.',json.dumps(features)))
+        conn.execute('INSERT OR IGNORE INTO product_attributes VALUES (?,?,NULL,?,?)',(code,attribute,number,unit))
+        actual_category = conn.execute('SELECT category FROM product_details WHERE item_code=?',(code,)).fetchone()[0]
+        groups.setdefault(actual_category,[]).append(code)
+    for codes in groups.values():
+        if len(codes)>1:
+            for index,code in enumerate(codes):
+                conn.execute('INSERT OR IGNORE INTO product_relations VALUES (?,?,?,?)',
+                    (code,codes[(index+1)%len(codes)],'substitute','Fictional same-category candidate; compare required features before choosing.'))
+    for category,related,kind in [('keyboards','mice','accessory'),('storage','hubs','compatible'),
+                                   ('monitors','monitor_arms','accessory'),('hubs','cables','compatible')]:
+        for code,target in zip(groups.get(category,[]),groups.get(related,[])):
+            conn.execute('INSERT OR IGNORE INTO product_relations VALUES (?,?,?,?)',
+                         (code,target,kind,'Recorded fictional demo relationship; applies to these models only.'))
+
+
+def demo_order(conn, oid, customer, lines, as_of, placed=False):
+    if conn.execute('SELECT 1 FROM orders WHERE order_id=?',(oid,)).fetchone():
+        return
+    additions = {'orders':1,'order_requests':len(lines),'order_fulfilled':len(lines) if placed else 0,
+                 'invoice_lines':len(lines) if placed else 0}
+    for table,addition in additions.items():
+        require(conn.execute(f'SELECT count(*) FROM {table}').fetchone()[0]+addition<=500,
+                f'Demo scenarios would exceed 500 {table} rows; use a fresh --db path.')
+    conn.execute('INSERT INTO orders(order_id,order_date,customer_id,subtotal,charged_price) VALUES (?,?,?,0,0)',
+                 (oid,as_of.isoformat(),customer))
+    subtotal = Decimal(0)
+    for code,qty in lines:
+        item = conn.execute('SELECT * FROM items WHERE item_code=?',(code,)).fetchone()
+        require(item is not None and item['availablequantity']>=qty,f'{code} needs stock for the demo scenario.')
+        price = price_for(conn,item,as_of.isoformat())
+        amount = money(price*qty)
+        subtotal += amount
+        conn.execute('INSERT INTO order_requests(order_id,item_code,quantity) VALUES (?,?,?)',(oid,code,qty))
+        if placed:
+            conn.execute('INSERT INTO order_fulfilled(order_id,item_code,quantity) VALUES (?,?,?)',(oid,code,qty))
+            conn.execute('INSERT INTO invoice_lines(order_id,item_code,qty_billed,unit_price_billed,line_total) VALUES (?,?,?,?,?)',
+                         (oid,code,qty,str(price),str(amount)))
+            updated = conn.execute('UPDATE items SET availablequantity=availablequantity-? WHERE item_code=? AND availablequantity>=?',(qty,code,qty))
+            require(updated.rowcount==1,'Demo bulk order has insufficient inventory.')
+    update_totals(conn,oid,totals(conn,subtotal))
+    if placed:
+        conn.execute('UPDATE orders SET order_invoice=? WHERE order_id=?',('INV-FAKE-DEMO-BULK' if oid=='FAKE-DEMO-BULK' else 'INV-'+oid,oid))
+
+
+def enrich(conn, as_of):
+    seed_product_details(conn)
+    customer = 'FAKE-CUST-0001'
+    require(conn.execute('SELECT 1 FROM customers WHERE customer_id=?',(customer,)).fetchone(),
+            'The original fictional customer batch is incomplete; use a fresh --db path.')
+    demo_order(conn,'FAKE-DEMO-DRAFT',customer,[('FAKE-ITEM-0001',1),('FAKE-ITEM-0002',1)],as_of)
+    if not conn.execute("SELECT 1 FROM orders WHERE order_id='FAKE-DEMO-BULK'").fetchone():
+        for item in conn.execute("SELECT * FROM items WHERE item_code GLOB 'FAKE-ITEM-*' ORDER BY sellingprice DESC,item_code").fetchall():
+            price = price_for(conn,item,as_of.isoformat())
+            if price<=0:
+                continue
+            quantity = int((Decimal('6000')/price).to_integral_value(rounding=ROUND_CEILING))
+            if quantity<=item['availablequantity']:
+                demo_order(conn,'FAKE-DEMO-BULK',customer,[(item['item_code'],quantity)],as_of,placed=True)
+                break
+        else:
+            raise ValueError('Not enough demo stock for a valid bulk invoice. Use a fresh --db path.')
+    currency = conn.execute("SELECT value FROM billing_config WHERE key='currency'").fetchone()[0]
+    for order in conn.execute("SELECT * FROM orders WHERE order_id GLOB 'FAKE-*' ORDER BY order_id").fetchall():
+        placed = bool(order['order_invoice'])
+        contact = dict(conn.execute('SELECT * FROM customers WHERE customer_id=?',(order['customer_id'],)).fetchone())
+        conn.execute('''INSERT OR IGNORE INTO order_details(order_id,currency,due_date,customer_snapshot)
+            VALUES (?,?,?,?)''',(order['order_id'],currency,
+                (date.fromisoformat(order['order_date'])+timedelta(days=30)).isoformat() if placed else None,
+                json.dumps(contact) if placed else None))
+    from database.service_seed import seed_service_scenarios
+    seed_service_scenarios(conn,as_of,demo_order)
+    conn.execute('INSERT INTO billing_audit(action,details_json) VALUES (?,?)',('seed_demo_enrichment',
+        json.dumps({'fictional':True,'as_of':as_of.isoformat(),'note':'Generated fixture records, not live customer transactions.'})))
+
+
+def audit_enrichment(conn):
+    require(not conn.execute('PRAGMA foreign_key_check').fetchall(),'Foreign key violations found.')
+    require(conn.execute('PRAGMA integrity_check').fetchone()[0]=='ok','SQLite integrity check failed.')
+    for table in MAIN_COUNTS:
+        require(300<=conn.execute(f'SELECT count(*) FROM {table}').fetchone()[0]<=500,f'{table} is outside 300-500 rows.')
+    for order in conn.execute("SELECT * FROM orders WHERE order_id GLOB 'FAKE-*'").fetchall():
+        oid = order['order_id']
+        require(money(order['subtotal'])-money(order['discount_applied'])+money(order['tax_amount'])+money(order['shipping_amount'])
+                == money(order['charged_price']),f'{oid} total mismatch.')
+        if order['order_invoice']:
+            requested = dict(conn.execute('SELECT item_code,quantity FROM order_requests WHERE order_id=?',(oid,)))
+            fulfilled = dict(conn.execute('SELECT item_code,quantity FROM order_fulfilled WHERE order_id=?',(oid,)))
+            lines = conn.execute('SELECT * FROM invoice_lines WHERE order_id=?',(oid,)).fetchall()
+            require(fulfilled=={r['item_code']:r['qty_billed'] for r in lines} and all(requested.get(code,0)>=qty for code,qty in fulfilled.items()) and (requested==fulfilled or oid=='FAKE-SVC-PARTIAL'),f'{oid} quantity mismatch.')
+            require(sum((money(r['line_total']) for r in lines),Decimal(0))==money(order['subtotal']),f'{oid} subtotal mismatch.')
+            require(all(money(r['unit_price_billed'])*r['qty_billed']==money(r['line_total']) for r in lines),f'{oid} line arithmetic mismatch.')
+        require(money(order['refund_amount'] or 0)<=money(order['charged_price']),f'{oid} refund exceeds invoice.')
+
+
+
+def scenarios(conn):
+    keyboards = conn.execute("SELECT item_code FROM product_details WHERE category='keyboards' AND item_code GLOB 'FAKE-*' ORDER BY item_code LIMIT 2").fetchall()
+    expensive = conn.execute("SELECT i.item_code FROM items i JOIN product_details d ON d.item_code=i.item_code         WHERE d.category='keyboards' AND i.item_code GLOB 'FAKE-*' AND i.availablequantity>0         AND (SELECT COUNT(*) FROM price_history h WHERE h.item_code=i.item_code AND h.effective_from<=CURRENT_DATE AND (h.effective_to IS NULL OR h.effective_to>=CURRENT_DATE))<=1         ORDER BY COALESCE((SELECT unit_price FROM price_history h WHERE h.item_code=i.item_code AND h.effective_from<=CURRENT_DATE AND (h.effective_to IS NULL OR h.effective_to>=CURRENT_DATE)),i.sellingprice) DESC,i.item_code LIMIT 1").fetchone()
+    return {'customer_id':'FAKE-CUST-0001','draft_order_id':'FAKE-DEMO-DRAFT','refund_order_id':'FAKE-DEMO-BULK',
+            'invoice_number':'INV-FAKE-DEMO-BULK','comparison_items':[r[0] for r in keyboards],
+            'cheaper_alternatives_source':expensive[0] if expensive else None,
+            'promo_code':'FAKE-PERCENT-10','new_customer_example':'DEMO-NEW-001',
+            'service_examples':{'partial_invoice':'FAKE-SVC-PARTIAL','reported_duplicate_charge':'FAKE-SVC-DUPLICATE','b2g1_return':'FAKE-SVC-B2G','shipped':'FAKE-SVC-SHIPPED','delivered':'FAKE-SVC-DELIVERED','pending_above_threshold':'FAKE-SVC-PENDING'},
+            'note':'Use the printed IDs with the existing tools. Mutation demos require customer confirmation; reruns do not reset consumed drafts or refunds.'}
 
 
 def counts(conn):
@@ -76,7 +230,7 @@ def audit(conn, opening_stock):
                 item = conn.execute("SELECT * FROM items WHERE item_code=?", (code,)).fetchone()
                 require(item["availablequantity"] >= quantity, f"{oid} draft quantity exceeds stock.")
                 subtotal += price_for(conn, item, order["order_date"]) * quantity
-        for field, amount in totals(conn, subtotal, order["promo_code"]).items():
+        for field, amount in totals(conn, subtotal, order["promo_code"], check_expiry=False).items():
             require(money(order[field]) == money(amount), f"{oid}: {field} is inconsistent.")
         if order["refund_amount"] is not None:
             require(bool(order["order_invoice"]) and order["refund_status"] == "recorded"
@@ -102,11 +256,33 @@ def generate(db_path: Path, seed: int, as_of: date):
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     try:
-        # Schema creation and all seed records share a single rollback boundary.
-        conn.executescript("BEGIN IMMEDIATE;\n" + (settings.ROOT / "database/schema.sql").read_text(encoding="utf-8"))
+        from database.migrations import remove_retired_tables, remove_views
+        remove_views(conn)
+        backup = remove_retired_tables(conn)
+        # Seed schema and records share a rollback boundary. Retired-table cleanup
+        # is a separate migration; any populated retired records are backed up first.
+        schema = '\n'.join((settings.ROOT / 'database' / name).read_text(encoding='utf-8')
+                           for name in ('schema.sql','operations.sql','insights.sql','service.sql'))
+        conn.executescript("BEGIN IMMEDIATE;\n" + schema)
+        from database.migrations import add_promotion_expiry, add_unknown_fulfillment
+        add_promotion_expiry(conn)
+        add_unknown_fulfillment(conn)
+        if conn.execute("SELECT 1 FROM billing_config WHERE key=?", (ENRICHMENT_MARKER,)).fetchone():
+            from database.service_seed import seed_service_scenarios
+            seed_service_scenarios(conn,as_of,demo_order)
+            result = {"status": "already_seeded", "database": str(db_path), "rows": counts(conn), 'scenarios':scenarios(conn), 'retired_records_backup':backup}
+            conn.commit()
+            return result
         if conn.execute("SELECT 1 FROM billing_config WHERE key=?", (MARKER,)).fetchone():
-            result = {"status": "already_seeded", "database": str(db_path), "rows": counts(conn)}
-            conn.rollback()
+            before = counts(conn)
+            enrich(conn,as_of)
+            audit_enrichment(conn)
+            conn.execute('INSERT INTO billing_config VALUES (?,?)',(ENRICHMENT_MARKER,f'seed={seed};as_of={as_of.isoformat()}'))
+            after = counts(conn)
+            result = {'status':'upgraded','database':str(db_path),'rows':after,
+                      'added':{table:after[table]-before[table] for table in TABLES},
+                      'scenarios':scenarios(conn),'validated':True,'retired_records_backup':backup}
+            conn.commit()
             return result
         before = counts(conn)
         for table, addition in MAIN_COUNTS.items():
@@ -151,8 +327,8 @@ def generate(db_path: Path, seed: int, as_of: date):
             for value in values:
                 code = f"FAKE-{kind.upper()}-{value}"
                 promos.append(code)
-                conn.execute("INSERT INTO promotions VALUES (?,?,?,?)",
-                             (code, f"Fictional demo {kind} discount {value}", kind, str(value)))
+                conn.execute("INSERT INTO promotions(promo_code,description,discount_type,discount_value,expires_on) VALUES (?,?,?,?,?)",
+                             (code, f"Fictional demo {kind} discount {value}", kind, str(value), (as_of+timedelta(days=365)).isoformat()))
         rng.shuffle(item_codes)
         cursor = 0
         refunded = {i: ("full" if n % 2 == 0 else "partial")
@@ -182,7 +358,7 @@ def generate(db_path: Path, seed: int, as_of: date):
                     updated = conn.execute("UPDATE items SET availablequantity=availablequantity-? WHERE item_code=? AND availablequantity>=?",
                                            (quantity, code, quantity))
                     require(updated.rowcount == 1, f"Insufficient stock for {code}.")
-            values = totals(conn, subtotal, promo)
+            values = totals(conn, subtotal, promo, check_expiry=False)
             update_totals(conn, oid, values)
             if placed:
                 conn.execute("UPDATE orders SET order_invoice=? WHERE order_id=?", (f"INV-FAKE-{as_of.year}-{i:04d}", oid))
@@ -196,12 +372,16 @@ def generate(db_path: Path, seed: int, as_of: date):
                                  (str(refund), reason, oid))
                     refund_counts[kind] += 1
         audit(conn, opening_stock)
+        enrich(conn, as_of)
+        audit_enrichment(conn)
         conn.execute("INSERT INTO billing_config(key,value) VALUES (?,?)", (MARKER, f"seed={seed};as_of={as_of.isoformat()}"))
+        conn.execute("INSERT INTO billing_config(key,value) VALUES (?,?)", (ENRICHMENT_MARKER, f"seed={seed};as_of={as_of.isoformat()}"))
         after = counts(conn)
         result = {"status": "inserted", "database": str(db_path), "rows": after,
                   "added": {table: after[table]-before[table] for table in TABLES},
-                  "placed_orders_added": 300, "draft_orders_added": 50,
-                  "ledger_refunds_added": refund_counts, "validated": True}
+                  "placed_orders_added": 307, "draft_orders_added": 51,
+                  "ledger_refunds_added": refund_counts, "validated": True,
+                  'scenarios':scenarios(conn),'retired_records_backup':backup}
         conn.commit()
         return result
     except BaseException:
@@ -221,7 +401,7 @@ def main():
     try:
         print(json.dumps(generate(path, args.seed, args.as_of), indent=2))
     except (ValueError, sqlite3.Error, ArithmeticError) as exc:
-        parser.exit(1, f"Seed failed; transaction rolled back: {exc}\n")
+        parser.exit(1, f"Seed records rolled back: {exc}\nRetired-table cleanup, if applied, is a separate migration.\n")
 
 
 if __name__ == "__main__":
