@@ -60,12 +60,6 @@ def conversation(conversation_id=None, customer_id=None, mode='customer'):
         return conversation_id
 
 
-def associate_customer(conversation_id, customer_id):
-    with connection() as conn:
-        conn.execute("UPDATE conversations SET customer_id=? WHERE conversation_id=? AND customer_id IS NULL AND mode='customer'",
-                     (customer_id, conversation_id))
-
-
 def get_conversation(conversation_id):
     with connection() as conn:
         row = conn.execute("SELECT * FROM conversations WHERE conversation_id=?", (conversation_id,)).fetchone()
@@ -77,7 +71,9 @@ def shopping_state(conversation_id):
     with connection() as conn:
         row = conn.execute('SELECT state_json FROM shopping_states WHERE conversation_id=?',
                            (conversation_id,)).fetchone()
-        return json.loads(row[0]) if row else empty_state()
+        defaults = empty_state()
+        saved = json.loads(row[0]) if row else {}
+        return {**defaults, **{key: value for key, value in saved.items() if key in defaults}}
 
 
 def write_shopping_state(conn, conversation_id, state):
@@ -93,11 +89,8 @@ def checkpoint_shopping(conversation_id, request_id, state, customer_id):
             ON m.conversation_id=c.conversation_id WHERE c.conversation_id=? AND c.mode='customer'
             AND m.request_id=? AND m.role='user' AND m.status='pending' ''',
             (conversation_id, request_id)).fetchone()
-        if record is None or (record['customer_id'] and record['customer_id'] != customer_id):
+        if record is None or record['customer_id'] != customer_id:
             raise ValueError('Shopping checkpoint does not match the active conversation.')
-        if customer_id and not record['customer_id']:
-            conn.execute('UPDATE conversations SET customer_id=? WHERE conversation_id=?',
-                         (customer_id, conversation_id))
         write_shopping_state(conn, conversation_id, state)
 
 
